@@ -74,8 +74,9 @@
         <h2 id="savedH">Saved batches</h2>
         <span id="savedSum" class="meta"></span>
       </div>
-      <p id="savedEmpty" class="empty">Batches you save stay here for 14 days, so you can send one again if needed.</p>
+      <p id="savedEmpty" class="empty">Batches you save stay here until you delete them, so you can send one again if needed.</p>
       <ul id="savedList" class="saved"></ul>
+      <button id="btnDeleteAllSaved" class="link-btn danger del-all" type="button" hidden>Delete all</button>
     </section>
 
     <footer class="foot">
@@ -107,6 +108,13 @@
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 3L5 13.5h6L10 21l8-10.5h-6z"/></svg>
     </button>
     <button id="btnAuto" class="pill-btn" type="button" aria-pressed="true">Auto</button>
+  </div>
+  <div id="undoBar" class="undo-bar" role="status" hidden>
+    <span id="undoText">Page saved</span>
+    <button id="btnUndo" class="undo-btn" type="button">Undo</button>
+  </div>
+  <div class="cam-modes">
+    <div id="modeStrip" class="mode-strip" role="group" aria-label="Scan mode for new pages"></div>
   </div>
   <div class="cam-bottom">
     <button id="btnThumb" class="thumb-btn" type="button" aria-label="Review pages">
@@ -158,6 +166,7 @@
       <h2 id="edTitle">Page</h2>
       <p id="edMeta" class="meta"></p>
     </div>
+    <button id="btnRetake" class="pill-btn" type="button">Retake</button>
     <button id="btnEdDelete" class="pill-btn pill-danger" type="button">Delete</button>
   </header>
   <div class="ed-stage">
@@ -172,7 +181,8 @@
     <div id="edBusy" class="busy" hidden><span class="spinner"></span></div>
   </div>
   <div id="edTools" class="ed-tools">
-    <div id="filterChips" class="chips" role="group" aria-label="Filter"></div>
+    <div id="filterChips" class="chips" role="group" aria-label="Scan mode"></div>
+    <button id="btnApplyAll" class="apply-all" type="button" hidden>Use this mode on all pages</button>
     <div class="tool-row">
       <button id="btnMoveUp" class="tool" type="button">‹ Earlier</button>
       <button id="btnCrop" class="tool" type="button">Crop</button>

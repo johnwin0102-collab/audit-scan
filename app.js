@@ -1,10 +1,10 @@
 /* Audit Scan: phone document scanner for audit fieldwork.
-   Camera -> page edges (worker) -> cropped, enhanced pages -> one PDF per batch -> Save to Drive. */
+   Camera -> AI page finder (ml-worker) -> crop + scan modes (cv-worker) -> one PDF per batch -> Save to Drive. */
 /* global DB, PDF */
 "use strict";
 
 (() => {
-  const VERSION = "1.0.0";
+  const VERSION = "1.1.0";
 
   const AREAS = [
     { value: "Mixed", label: "Mixed (Claude sorts)", short: "" },
@@ -20,19 +20,27 @@
     { value: "Agreements & minutes", label: "Agreements & minutes", short: "Agreements" },
     { value: "Other", label: "Other", short: "Other" },
   ];
+  // Scan modes, modelled on CamScanner's filter set.
   const FILTERS = [
-    { value: "enhanced", label: "Enhanced" },
+    { value: "auto", label: "Auto" },
     { value: "original", label: "Original" },
+    { value: "lighten", label: "Lighten" },
+    { value: "magic", label: "Magic colour" },
+    { value: "noshadow", label: "No shadow" },
     { value: "grey", label: "Grey" },
     { value: "bw", label: "B&W" },
+    { value: "bw2", label: "B&W 2" },
   ];
+  const FILTER_ALIASES = { enhanced: "magic" };   // pages scanned with version 1.0
   const FULL = [[0, 0], [1, 0], [1, 1], [0, 1]];
-  const DETECT_EDGE = 420;     // px, preview frame used for edge detection
+  const DETECT_EDGE = 420;     // px, preview frame for the classical edge finder
+  const ML_SIZE = 224;         // px, input of the AI page finder
+  const ML_MIN_SCORE = 0.5;    // AI confidence needed to treat something as a page
   const HOLD_MS = 900;         // page must be steady this long before an automatic capture
   const STEADY = 0.022;        // corner movement (share of the frame) still counted as steady
   const COOLDOWN_MS = 1200;    // minimum gap between automatic captures
   const MAX_IN_FLIGHT = 2;     // captures being processed at once
-  const KEEP_DAYS = 14;        // saved batches are kept this long
+  const UNDO_MS = 5000;        // how long the Undo button stays after a capture
   const RING = 238.76;         // shutter ring circumference
 
   /* ---------- Small helpers ---------- */
@@ -45,7 +53,9 @@
   const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
   const cleanName = (s) => String(s || "").replace(/[\\/:*?"<>|]+/g, " ").replace(/\s+/g, " ").trim();
   const areaOf = (v) => AREAS.find((a) => a.value === v) || AREAS[0];
-  const filterLabel = (v) => (FILTERS.find((f) => f.value === v) || FILTERS[0]).label;
+  const normFilter = (v) => { const f = FILTER_ALIASES[v] || v; return FILTERS.some((x) => x.value === f) ? f : "auto"; };
+  const filterLabel = (v) => FILTERS.find((f) => f.value === normFilter(v)).label;
+  const defaultFilter = () => normFilter(ls.get("as.filter", "auto"));
   const ls = {
     get(k, d = "") { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (_) { return d; } },
     set(k, v) { try { localStorage.setItem(k, v); } catch (_) { /* storage unavailable */ } },
@@ -89,6 +99,11 @@
     return m;
   }
   function lerpQuad(a, b, t) { return a.map((p, i) => [p[0] + (b[i][0] - p[0]) * t, p[1] + (b[i][1] - p[1]) * t]); }
+  function quadArea(q) {
+    let s = 0;
+    for (let i = 0; i < 4; i++) { const a = q[i], b = q[(i + 1) % 4]; s += a[0] * b[1] - b[0] * a[1]; }
+    return Math.abs(s) / 2;
+  }
   function orderQuad(pts) {
     const cx = pts.reduce((s, p) => s + p[0], 0) / 4, cy = pts.reduce((s, p) => s + p[1], 0) / 4;
     const sorted = [...pts].sort((a, b) => Math.atan2(a[1] - cy, a[0] - cx) - Math.atan2(b[1] - cy, b[0] - cx));
@@ -120,47 +135,75 @@
     saved: [],            // saved batches (kept 14 days)
     save: null,           // the save sheet's job
     editor: null,         // { id, crop, quad, busy, delArmed }
+    retake: null,         // { id, filter } while retaking a page
   };
 
-  /* ---------- Image engine (Web Worker) ---------- */
-  const engine = {
-    worker: null, seq: 0, pending: new Map(), state: "loading",
-    start() {
-      try { this.worker = new Worker("cv-worker.js"); }
-      catch (e) { this.fail(e); return; }
-      this.worker.onmessage = (e) => {
-        const { id, ok, result, error } = e.data || {};
-        const p = this.pending.get(id);
-        if (!p) return;
-        this.pending.delete(id);
-        if (ok) p.resolve(result); else p.reject(new Error(error));
-      };
-      this.worker.onerror = (e) => { e.preventDefault(); this.fail(e); };
-      this.call("init").then(() => { this.state = "ready"; renderEngine(); }, (e) => this.fail(e));
-    },
-    call(type, payload = {}, transfer = []) {
-      if (!this.worker || this.state === "failed") return Promise.reject(new Error("The scanner engine isn't running."));
-      return new Promise((resolve, reject) => {
-        const id = ++this.seq;
-        this.pending.set(id, { resolve, reject });
-        this.worker.postMessage(Object.assign({ id, type }, payload), transfer);
-      });
-    },
-    fail(e) {
-      console.error("Scanner engine failed", e);
-      this.state = "failed";
-      for (const p of this.pending.values()) p.reject(new Error("The scanner engine stopped."));
-      this.pending.clear();
-      renderEngine();
-    },
-  };
+  /* ---------- Workers: image engine (OpenCV) and AI page finder ---------- */
+  function makeWorker(url, options, name) {
+    return {
+      worker: null, seq: 0, pending: new Map(), state: "loading",
+      start() {
+        try { this.worker = new Worker(url, options); }
+        catch (e) { this.fail(e); return; }
+        this.worker.onmessage = (e) => {
+          const { id, ok, result, error } = e.data || {};
+          const p = this.pending.get(id);
+          if (!p) return;
+          this.pending.delete(id);
+          if (ok) p.resolve(result); else p.reject(new Error(error));
+        };
+        this.worker.onerror = (e) => { e.preventDefault(); this.fail(e); };
+        this.call("init").then(() => { this.state = "ready"; renderEngine(); }, (e) => this.fail(e));
+      },
+      call(type, payload = {}, transfer = []) {
+        if (!this.worker || this.state === "failed") return Promise.reject(new Error(name + " isn't running."));
+        return new Promise((resolve, reject) => {
+          const id = ++this.seq;
+          this.pending.set(id, { resolve, reject });
+          this.worker.postMessage(Object.assign({ id, type }, payload), transfer);
+        });
+      },
+      fail(e) {
+        console.error(name + " failed", e);
+        this.state = "failed";
+        for (const p of this.pending.values()) p.reject(new Error(name + " stopped."));
+        this.pending.clear();
+        renderEngine();
+      },
+    };
+  }
+  const engine = makeWorker("cv-worker.js", undefined, "The scanner engine");
+  const finder = makeWorker("ml-worker.js", { type: "module" }, "The page finder");
 
+  let failToastShown = false;
   function renderEngine() {
     const st = engine.state;
     el.engineChip.className = "chip" + (st === "ready" ? " is-ok" : st === "failed" ? " is-bad" : "");
     el.engineChip.textContent = st === "ready" ? "Scanner ready" : st === "failed" ? "Scanner didn't load" : "Loading scanner";
+    el.engineChip.title = finder.state === "ready" ? "AI page finder on" : finder.state === "failed" ? "AI page finder off; using the basic edge finder" : "AI page finder loading";
     el.btnShutter.disabled = st !== "ready";
-    if (st === "failed") toast("The scanner engine didn't load. Check your connection, then close and reopen the app.", 8000);
+    if (st === "failed" && !failToastShown) {
+      failToastShown = true;
+      toast("The scanner engine didn't load. Check your connection, then close and reopen the app.", 8000);
+    }
+  }
+
+  // The AI page finder takes a 224 x 224 picture of the whole frame.
+  const mlCanvas = document.createElement("canvas");
+  mlCanvas.width = mlCanvas.height = ML_SIZE;
+  const mlCtx = mlCanvas.getContext("2d", { willReadFrequently: true });
+  async function findPage(source) {
+    if (finder.state !== "ready") return null;
+    mlCtx.imageSmoothingEnabled = true;
+    mlCtx.imageSmoothingQuality = "medium";
+    mlCtx.drawImage(source, 0, 0, ML_SIZE, ML_SIZE);
+    const img = mlCtx.getImageData(0, 0, ML_SIZE, ML_SIZE);
+    try {
+      const r = await finder.call("detect", { buffer: img.data.buffer }, [img.data.buffer]);
+      return r.quad && r.score >= ML_MIN_SCORE && quadArea(r.quad) > 0.06 && quadOk(r.quad) ? r.quad : null;
+    } catch (_) {
+      return null;
+    }
   }
 
   /* ---------- Navigation ---------- */
@@ -319,6 +362,28 @@
     el.savedList.replaceChildren(...list.map(savedRow));
     el.savedEmpty.hidden = list.length > 0;
     el.savedSum.textContent = list.length ? plural(list.length, "batch", "batches") : "";
+    el.btnDeleteAllSaved.hidden = list.length < 2;
+    disarmDeleteAll();
+  }
+
+  let delAllArmed = false, delAllTimer = 0;
+  function disarmDeleteAll() {
+    delAllArmed = false;
+    clearTimeout(delAllTimer);
+    el.btnDeleteAllSaved.textContent = "Delete all";
+  }
+  async function onDeleteAllSaved() {
+    if (!delAllArmed) {
+      delAllArmed = true;
+      el.btnDeleteAllSaved.textContent = "Tap again to delete all";
+      delAllTimer = setTimeout(disarmDeleteAll, 4000);
+      return;
+    }
+    const ids = S.saved.map((b) => b.id);
+    for (const id of ids) await DB.deleteBatch(id).catch(() => {});
+    S.saved = [];
+    renderSaved();
+    toast("Saved batches deleted from this phone. Files already in Drive aren't affected.");
   }
   function savedRow(b) {
     const li = node("li");
@@ -343,6 +408,7 @@
       await DB.deleteBatch(b.id).catch(() => {});
       S.saved = S.saved.filter((x) => x.id !== b.id);
       renderSaved();
+      toast("Deleted from this phone. The copy in Drive isn't affected.");
     });
     act.append(again, del);
     li.append(main, act);
@@ -372,6 +438,8 @@
   async function startCamera() {
     renderCamLabel();
     updateCounter();
+    renderModes();
+    el.undoBar.hidden = true;
     el.camError.hidden = true;
     if (cam.stream) { loopStart(); return; }
     if (cam.starting) return;
@@ -436,6 +504,8 @@
   }
 
   function stopCamera() {
+    clearTimeout(undoTimer);
+    if (el.undoBar) el.undoBar.hidden = true;
     cancelAnimationFrame(cam.raf);
     cam.raf = 0;
     if (cam.stream) {
@@ -480,7 +550,8 @@
   function tick() {
     cam.raf = requestAnimationFrame(tick);
     const v = el.video;
-    if (cam.busy || engine.state !== "ready" || !cam.stream || v.readyState < 2 || !v.videoWidth) return;
+    if (cam.busy || !cam.stream || v.readyState < 2 || !v.videoWidth) return;
+    if (finder.state !== "ready" && engine.state !== "ready") return;
     const vw = v.videoWidth, vh = v.videoHeight;
     const s = DETECT_EDGE / Math.max(vw, vh);
     const w = Math.round(vw * s), h = Math.round(vh * s);
@@ -488,12 +559,26 @@
     detCtx.drawImage(v, 0, 0, w, h);
     sigCtx.drawImage(cam.det, 0, 0, 24, 24);
     cam.sig = signature(sigCtx.getImageData(0, 0, 24, 24).data);
-    const img = detCtx.getImageData(0, 0, w, h);
     cam.busy = true;
-    engine.call("detect", { width: w, height: h, buffer: img.data.buffer }, [img.data.buffer])
-      .then((r) => { if (cam.stream) onDetect(r.quad); })
+    detectLive(v, w, h)
+      .then((q) => { if (cam.stream) onDetect(q); })
       .catch(() => {})
       .finally(() => { cam.busy = false; });
+  }
+
+  // AI page finder first; the classical edge finder covers frames where the AI sees no page
+  // (and everything, if the AI model couldn't load).
+  async function detectLive(v, w, h) {
+    if (finder.state === "ready") {
+      const q = await findPage(v);
+      if (q) return q;
+    }
+    if (engine.state === "ready" && cam.inFlight === 0) {
+      const img = detCtx.getImageData(0, 0, w, h);
+      const r = await engine.call("detect", { width: w, height: h, buffer: img.data.buffer }, [img.data.buffer]);
+      return r.quad || null;
+    }
+    return null;
   }
 
   function signature(data) {
@@ -559,7 +644,7 @@
     if (engine.state !== "ready") { toast("The scanner is still loading."); return; }
     if (!cam.stream || !S.batch || cam.inFlight >= MAX_IN_FLIGHT) return;
     const now = performance.now();
-    const hint = cam.lastQuad && now - cam.lastQuadAt < 500 ? cam.lastQuad : null;
+    const previewQuad = cam.lastQuad && now - cam.lastQuadAt < 500 ? cam.lastQuad : null;
     cam.armed = false;
     cam.capturedAt = now;
     cam.capturedSig = cam.sig;
@@ -570,6 +655,8 @@
     let bitmap;
     try { bitmap = await createImageBitmap(el.video); }
     catch (_) { toast("That frame couldn't be captured. Try again."); return; }
+    // Ask the AI page finder about this exact frame; fall back to what the preview saw.
+    const hint = finder.state === "ready" ? await findPage(bitmap) : previewQuad;
     await processCapture(bitmap, hint);
   }
 
@@ -582,15 +669,25 @@
       let bitmap;
       try { bitmap = await createImageBitmap(f); }
       catch (_) { failed++; continue; }
-      if (await processCapture(bitmap, null)) done++; else failed++;
+      const hint = await findPage(bitmap);
+      if (await processCapture(bitmap, hint)) done++; else failed++;
     }
     toast(`Imported ${plural(done, "page", "pages")}` + (failed ? `. ${failed} couldn't be read.` : "."));
   }
 
   async function processCapture(bitmap, hint) {
-    const page = { id: uid(), batchId: S.batch.id, createdAt: Date.now(), filter: ls.get("as.filter", "enhanced"), rotation: 0, status: "processing" };
     const batch = S.batch;
-    batch.pageIds.push(page.id);
+    const page = { id: uid(), batchId: batch.id, createdAt: Date.now(), filter: defaultFilter(), rotation: 0, status: "processing" };
+    // Retake: the new page takes the old page's place.
+    const retake = S.retake && batch.pageIds.includes(S.retake.id) ? S.retake : null;
+    S.retake = null;
+    if (retake) {
+      const at = batch.pageIds.indexOf(retake.id);
+      batch.pageIds.splice(at, 1, page.id);
+      page.filter = retake.filter || page.filter;
+    } else {
+      batch.pageIds.push(page.id);
+    }
     S.pages.set(page.id, page);
     cam.inFlight++;
     updateCounter();
@@ -601,15 +698,31 @@
         status: "ready", frame: r.frameBlob, frameW: r.frameW, frameH: r.frameH, quad: r.quad, auto: r.auto,
         warped: r.warpedBlob, output: r.outputBlob, thumb: r.thumbBlob, w: r.w, h: r.h,
       });
-      if (S.batch !== batch) return false;   // batch was discarded meanwhile
+      if (S.batch !== batch || !batch.pageIds.includes(page.id)) return false;   // discarded meanwhile
       await DB.put("pages", page);
+      if (retake) {
+        S.pages.delete(retake.id);
+        dropThumb(retake.id);
+        await DB.del("pages", retake.id).catch(() => {});
+      }
       batch.updatedAt = Date.now();
       await saveBatch();
       setThumb(page);
+      if (retake) {
+        toast(`Page ${batch.pageIds.indexOf(page.id) + 1} replaced.`);
+        if (S.screen === "camera") show("review");
+      } else if (S.screen === "camera") {
+        offerUndo(page.id);
+      }
       if (!r.auto) toast("No page edges found, so the whole photo was kept. You can crop it in Review.");
       return true;
     } catch (err) {
-      batch.pageIds = batch.pageIds.filter((x) => x !== page.id);
+      if (retake) {
+        const at = batch.pageIds.indexOf(page.id);
+        if (at >= 0) batch.pageIds.splice(at, 1, retake.id);
+      } else {
+        batch.pageIds = batch.pageIds.filter((x) => x !== page.id);
+      }
       S.pages.delete(page.id);
       await saveBatch().catch(() => {});
       toast(storageErr(err) || "That page couldn't be processed. Try again.");
@@ -619,6 +732,57 @@
       updateCounter();
       if (S.screen === "review") renderReview();
     }
+  }
+
+  // Undo the last capture from the camera screen.
+  let undoTimer = 0;
+  function offerUndo(id) {
+    clearTimeout(undoTimer);
+    const n = S.batch.pageIds.indexOf(id) + 1;
+    el.undoText.textContent = `Page ${n} saved`;
+    el.btnUndo.onclick = async () => {
+      el.undoBar.hidden = true;
+      if (await removePage(id)) toast(`Page ${n} removed.`);
+    };
+    el.undoBar.hidden = false;
+    undoTimer = setTimeout(() => { el.undoBar.hidden = true; }, UNDO_MS);
+  }
+
+  // Remove one page from the open batch (Review ×, editor Delete, camera Undo).
+  async function removePage(id) {
+    const b = S.batch;
+    if (!b || !b.pageIds.includes(id)) return false;
+    b.pageIds = b.pageIds.filter((x) => x !== id);
+    S.pages.delete(id);
+    dropThumb(id);
+    await DB.del("pages", id).catch(() => {});
+    b.updatedAt = Date.now();
+    await saveBatch().catch(() => {});
+    updateCounter();
+    if (S.screen === "review") renderReview();
+    return true;
+  }
+
+  // Camera mode strip: the scan mode new pages get.
+  function renderModes() {
+    const cur = defaultFilter();
+    for (const b of el.modeStrip.children) {
+      const on = b.dataset.filter === cur;
+      b.setAttribute("aria-pressed", String(on));
+      if (on && S.screen === "camera") b.scrollIntoView({ block: "nearest", inline: "center" });
+    }
+  }
+  function fillModes() {
+    el.modeStrip.replaceChildren(...FILTERS.map((f) => {
+      const b = node("button", "mode-btn", f.label);
+      b.type = "button";
+      b.dataset.filter = f.value;
+      b.addEventListener("click", () => {
+        ls.set("as.filter", f.value);
+        renderModes();
+      });
+      return b;
+    }));
   }
 
   function setThumb(p) {
@@ -673,6 +837,27 @@
     btn.append(frame, cap);
     btn.addEventListener("click", () => { if (p.status === "ready") openEditor(p.id); });
     li.append(btn);
+    // Delete straight from the grid: tap ×, then tap again to confirm.
+    if (p.status === "ready") {
+      const del = node("button", "tile-del", "×");
+      del.type = "button";
+      del.setAttribute("aria-label", `Delete page ${i + 1}`);
+      let armed = false, t = 0;
+      del.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        if (!armed) {
+          armed = true;
+          del.textContent = "Delete?";
+          del.classList.add("armed");
+          del.setAttribute("aria-label", `Tap again to delete page ${i + 1}`);
+          t = setTimeout(() => { armed = false; del.textContent = "×"; del.classList.remove("armed"); del.setAttribute("aria-label", `Delete page ${i + 1}`); }, 3500);
+          return;
+        }
+        clearTimeout(t);
+        if (await removePage(p.id)) toast(`Page ${i + 1} deleted.`);
+      });
+      li.append(del);
+    }
     return li;
   }
 
@@ -717,7 +902,10 @@
     edUrl = URL.createObjectURL(p.output);
     el.edImg.src = edUrl;
     el.edImg.alt = `Page ${idx + 1}`;
-    for (const b of el.filterChips.children) b.setAttribute("aria-pressed", String(b.dataset.filter === p.filter));
+    const pf = normFilter(p.filter);
+    for (const b of el.filterChips.children) b.setAttribute("aria-pressed", String(b.dataset.filter === pf));
+    el.btnApplyAll.hidden = ids.length < 2;
+    el.btnApplyAll.textContent = `Use ${filterLabel(pf)} on all ${ids.length} pages`;
     el.btnMoveUp.disabled = idx <= 0;
     el.btnMoveDown.disabled = idx >= ids.length - 1;
     el.btnCrop.disabled = !p.frame;
@@ -756,9 +944,45 @@
 
   function setFilter(f) {
     const p = curPage();
-    if (!p || p.filter === f) return;
-    ls.set("as.filter", f);   // new pages use the last filter chosen
+    if (!p || normFilter(p.filter) === f) return;
+    ls.set("as.filter", f);   // new pages use the last mode chosen
     rerender(p, { filter: f }, false);
+  }
+
+  // Apply the current page's mode to every page in the batch.
+  async function applyAll() {
+    const p = curPage();
+    if (!p || !S.editor || S.editor.busy) return;
+    const f = normFilter(p.filter);
+    const targets = S.batch.pageIds.map((id) => S.pages.get(id)).filter((x) => x && x.status === "ready" && x.warped && normFilter(x.filter) !== f);
+    if (!targets.length) { toast(`All pages already use ${filterLabel(f)}.`); return; }
+    setBusy(true);
+    let done = 0;
+    try {
+      for (const t of targets) {
+        el.edMeta.textContent = `Applying ${filterLabel(f)}… ${done + 1} of ${targets.length}`;
+        const r = await engine.call("render", { warpedBlob: t.warped, rotation: t.rotation, filter: f });
+        Object.assign(t, { filter: f, output: r.outputBlob, thumb: r.thumbBlob, w: r.w, h: r.h });
+        await DB.put("pages", t);
+        setThumb(t);
+        done++;
+      }
+      toast(`${filterLabel(f)} applied to ${plural(done, "more page", "more pages")}.`);
+    } catch (err) {
+      toast(storageErr(err) || `Stopped after ${plural(done, "page", "pages")}. Try again.`);
+    } finally {
+      setBusy(false);
+      if (S.screen === "editor") renderEditor();
+    }
+  }
+
+  // Retake: go back to the camera; the next capture replaces this page in the same position.
+  function retakePage() {
+    const p = curPage();
+    if (!p || !S.editor || S.editor.busy) return;
+    S.retake = { id: p.id, filter: p.filter };
+    show("camera");
+    toast("Retake: the next page you capture replaces this one.");
   }
   function rotatePage() {
     const p = curPage();
@@ -787,15 +1011,10 @@
       return;
     }
     clearTimeout(delTimer);
-    const ids = S.batch.pageIds;
-    const idx = ids.indexOf(p.id);
-    S.batch.pageIds = ids.filter((x) => x !== p.id);
-    S.pages.delete(p.id);
-    dropThumb(p.id);
-    await DB.del("pages", p.id).catch(() => {});
-    await saveBatch().catch(() => {});
+    const idx = S.batch.pageIds.indexOf(p.id);
+    await removePage(p.id);
     const nextId = S.batch.pageIds[Math.min(idx, S.batch.pageIds.length - 1)];
-    toast("Page deleted.");
+    toast(`Page ${idx + 1} deleted.`);
     if (nextId) { S.editor = { id: nextId, crop: false, quad: null, busy: false, delArmed: false }; renderEditor(); }
     else goBack();
   }
@@ -873,7 +1092,12 @@
     if (!p || S.editor.busy) return;
     setBusy(true);
     try {
-      const r = await engine.call("detectFrame", { frameBlob: p.frame });
+      let hint = null;
+      if (finder.state === "ready") {
+        const bmp = await createImageBitmap(p.frame);
+        try { hint = await findPage(bmp); } finally { bmp.close(); }
+      }
+      const r = await engine.call("detectFrame", { frameBlob: p.frame, hint });
       if (r.quad) { S.editor.quad = r.quad; drawCrop(); }
       else toast("No page edges found. Drag the corners by hand.");
     } catch (_) {
@@ -1086,7 +1310,7 @@
       "cropPoly", "cropHandles", "edBusy", "edTools", "filterChips", "btnMoveUp", "btnCrop", "btnRotate", "btnMoveDown",
       "cropBar", "btnCropAuto", "btnCropFull", "btnCropCancel", "btnCropApply", "saveSheet", "saveName", "saveInfo",
       "saveActions", "saveHelp", "btnShare", "btnDownload", "btnSaveCancel", "saveDone", "saveDoneText", "btnNewBatch",
-      "btnKeepBatch", "toast",
+      "btnKeepBatch", "toast", "modeStrip", "undoBar", "undoText", "btnUndo", "btnApplyAll", "btnRetake", "btnDeleteAllSaved",
     ];
     for (const id of ids) {
       el[id] = $(id);
@@ -1129,6 +1353,9 @@
 
     el.btnEdBack.addEventListener("click", () => { if (S.editor && S.editor.crop) exitCrop(); else goBack(); });
     el.btnEdDelete.addEventListener("click", deletePage);
+    el.btnRetake.addEventListener("click", retakePage);
+    el.btnApplyAll.addEventListener("click", applyAll);
+    el.btnDeleteAllSaved.addEventListener("click", onDeleteAllSaved);
     el.btnRotate.addEventListener("click", rotatePage);
     el.btnCrop.addEventListener("click", enterCrop);
     el.btnMoveUp.addEventListener("click", () => movePage(-1));
@@ -1160,16 +1387,16 @@
     bind();
     fillAreas();
     fillFilters();
+    fillModes();
     el.verText.textContent = `Version ${VERSION}.`;
     engine.start();
+    finder.start();
     renderEngine();
     registerSW();
     try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (_) { /* best effort */ }
     try {
       const all = await DB.getAll("batches");
-      const cutoff = Date.now() - KEEP_DAYS * 864e5;
-      for (const b of all) if (b.status === "saved" && b.savedAt < cutoff) await DB.deleteBatch(b.id);
-      S.saved = all.filter((b) => b.status === "saved" && b.savedAt >= cutoff);
+      S.saved = all.filter((b) => b.status === "saved");
       const open = all.filter((b) => b.status === "open").sort((a, b) => b.updatedAt - a.updatedAt)[0];
       if (open) await loadBatch(open);
     } catch (err) {
@@ -1178,7 +1405,7 @@
     show("setup");
   }
 
-  window.__auditScan = { S, engine, cam };   // read by the automated test
+  window.__auditScan = { S, engine, finder, cam };   // read by the automated test
   boot().catch((err) => {
     console.error(err);
     document.body.insertAdjacentHTML("afterbegin", '<p style="padding:16px">Audit Scan failed to start. Reload the page.</p>');

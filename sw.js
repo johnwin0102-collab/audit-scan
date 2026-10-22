@@ -1,5 +1,5 @@
 /* Audit Scan offline cache. Bump VERSION on every release so phones pick up the update. */
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const CACHE = "audit-scan-" + VERSION;
 const APP = [
   "./",
@@ -9,6 +9,7 @@ const APP = [
   "db.js",
   "pdf.js",
   "cv-worker.js",
+  "ml-worker.js",
   "manifest.webmanifest",
   "fonts/atkinson-hyperlegible-latin-400-normal.woff2",
   "fonts/atkinson-hyperlegible-latin-700-normal.woff2",
@@ -20,13 +21,20 @@ const APP = [
   "icons/icon-maskable-512.png",
   "icons/apple-touch-icon.png",
 ];
-const ENGINE = "vendor/opencv.js";   // large and unchanging; the browser's own cache copy is fine
+// Large, versioned files that never change in place; the browser's own cache copy is fine.
+const ENGINE = [
+  "vendor/opencv.js",
+  "vendor/ml/ort.min.js",
+  "vendor/ml/ort-wasm-simd-threaded.mjs",
+  "vendor/ml/ort-wasm-simd-threaded.wasm",
+  "vendor/ml/doccornernet_lean.ort",
+];
 
 self.addEventListener("install", (event) => {
   event.waitUntil((async () => {
     const cache = await caches.open(CACHE);
     await cache.addAll(APP.map((u) => new Request(u, { cache: "reload" })));
-    await cache.add(ENGINE);
+    await cache.addAll(ENGINE);
   })());
 });
 
