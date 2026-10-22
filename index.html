@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#EDF2EA" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0F1713" media="(prefers-color-scheme: dark)">
+<meta name="description" content="Scan audit fieldwork documents on your phone and save them to your Google Drive inbox.">
+<title>Audit Scan</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png" sizes="192x192">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- Batch details -->
+<main id="scrSetup" class="screen paper" aria-labelledby="appTitle">
+  <div class="wrap">
+    <header class="top">
+      <div>
+        <h1 id="appTitle">Audit Scan</h1>
+        <p class="sub">Scan fieldwork documents straight into your Drive inbox.</p>
+      </div>
+      <span id="engineChip" class="chip" role="status">Loading scanner</span>
+    </header>
+
+    <div id="updateBar" class="banner" hidden>
+      <span>A new version is ready.</span>
+      <button id="btnUpdate" class="btn btn-small btn-pen" type="button">Update now</button>
+    </div>
+
+    <form id="batchForm" class="pad" novalidate>
+      <div class="pad-head">
+        <h2>Batch</h2>
+        <span id="batchState" class="ref">New batch</span>
+      </div>
+      <div class="cells">
+        <label class="cell span2" for="client">
+          <span class="lab">Client</span>
+          <input id="client" list="clientList" autocomplete="off" autocapitalize="words" spellcheck="false" placeholder="Name as per SSM" enterkeyhint="next">
+          <datalist id="clientList"></datalist>
+        </label>
+        <label class="cell cell-l" for="fye">
+          <span class="lab">FYE <span class="opt">(optional)</span></span>
+          <input id="fye" inputmode="decimal" autocomplete="off" placeholder="31.03.2026" enterkeyhint="next">
+        </label>
+        <label class="cell" for="area">
+          <span class="lab">Audit area</span>
+          <span class="sel"><select id="area"></select></span>
+        </label>
+        <label class="cell span2" for="note">
+          <span class="lab">Note <span class="opt">(optional)</span></span>
+          <input id="note" autocomplete="off" placeholder="e.g. March payment vouchers, file 2" enterkeyhint="done">
+        </label>
+      </div>
+    </form>
+
+    <p id="formMsg" class="msg" role="alert" hidden></p>
+
+    <button id="btnStart" class="btn btn-big btn-pen btn-block" type="button">Start scanning</button>
+
+    <section id="openBatch" class="open-batch" hidden aria-labelledby="openH">
+      <h2 id="openH" class="h-small">Batch in progress</h2>
+      <p id="openSummary" class="meta-line"></p>
+      <div class="row">
+        <button id="btnOpenReview" class="btn btn-line" type="button">Review pages</button>
+        <button id="btnDiscard" class="btn btn-quiet btn-danger" type="button">Discard batch</button>
+      </div>
+    </section>
+
+    <section aria-labelledby="savedH">
+      <div class="row-head">
+        <h2 id="savedH">Saved batches</h2>
+        <span id="savedSum" class="meta"></span>
+      </div>
+      <p id="savedEmpty" class="empty">Batches you save stay here for 14 days, so you can send one again if needed.</p>
+      <ul id="savedList" class="saved"></ul>
+    </section>
+
+    <footer class="foot">
+      <p>Scans stay on this phone until you save them. <span id="verText"></span></p>
+    </footer>
+  </div>
+</main>
+
+<!-- Camera -->
+<section id="scrCamera" class="screen camera" hidden aria-label="Camera">
+  <div class="cam-stage">
+    <video id="video" playsinline muted autoplay></video>
+    <svg id="overlay" class="overlay" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+      <polygon id="quadPoly" points=""></polygon>
+    </svg>
+    <div id="flash" class="flash" hidden></div>
+    <p id="hint" class="hint" aria-live="polite">Starting camera…</p>
+    <div id="camError" class="cam-error" hidden>
+      <p id="camErrorText"></p>
+      <button id="btnRetryCam" class="btn btn-pen" type="button">Try again</button>
+    </div>
+  </div>
+  <div class="cam-top">
+    <button id="btnCamBack" class="icon-btn" type="button" aria-label="Back to batch details">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+    </button>
+    <p id="camLabel" class="cam-label"></p>
+    <button id="btnTorch" class="icon-btn" type="button" aria-label="Flash" aria-pressed="false" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 3L5 13.5h6L10 21l8-10.5h-6z"/></svg>
+    </button>
+    <button id="btnAuto" class="pill-btn" type="button" aria-pressed="true">Auto</button>
+  </div>
+  <div class="cam-bottom">
+    <button id="btnThumb" class="thumb-btn" type="button" aria-label="Review pages">
+      <img id="thumbImg" alt="" hidden>
+      <span id="pageCount" class="count">0</span>
+    </button>
+    <button id="btnShutter" class="shutter" type="button" aria-label="Capture page">
+      <svg viewBox="0 0 84 84" aria-hidden="true">
+        <circle class="ring-bg" cx="42" cy="42" r="38"></circle>
+        <circle id="ringArc" class="ring-arc" cx="42" cy="42" r="38"></circle>
+      </svg>
+      <span class="shutter-core"></span>
+    </button>
+    <button id="btnDone" class="done-btn" type="button">Done</button>
+  </div>
+</section>
+
+<!-- Review -->
+<section id="scrReview" class="screen paper" hidden aria-labelledby="reviewH">
+  <header class="bar-top">
+    <button id="btnReviewBack" class="icon-btn" type="button" aria-label="Back to batch details">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+    </button>
+    <div class="bar-title">
+      <h2 id="reviewH">Review pages</h2>
+      <p id="reviewMeta" class="meta"></p>
+    </div>
+  </header>
+  <div class="wrap wrap-review">
+    <p id="reviewEmpty" class="empty" hidden>No pages yet. Tap Scan more to add some.</p>
+    <ol id="grid" class="grid" aria-label="Pages in this batch"></ol>
+  </div>
+  <div class="bar-bottom">
+    <button id="btnAddPages" class="btn btn-line" type="button">Scan more</button>
+    <label class="btn btn-line" for="importInput">Import
+      <input id="importInput" class="vh" type="file" accept="image/*" multiple>
+    </label>
+    <button id="btnSave" class="btn btn-pen" type="button">Save PDF</button>
+  </div>
+</section>
+
+<!-- Page editor -->
+<section id="scrEditor" class="screen editor" hidden aria-labelledby="edTitle">
+  <header class="bar-top dark">
+    <button id="btnEdBack" class="icon-btn" type="button" aria-label="Back to review">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+    </button>
+    <div class="bar-title">
+      <h2 id="edTitle">Page</h2>
+      <p id="edMeta" class="meta"></p>
+    </div>
+    <button id="btnEdDelete" class="pill-btn pill-danger" type="button">Delete</button>
+  </header>
+  <div class="ed-stage">
+    <img id="edImg" alt="">
+    <div id="cropWrap" class="crop-wrap" hidden>
+      <img id="cropImg" alt="Original photo">
+      <svg id="cropSvg" preserveAspectRatio="xMidYMid meet">
+        <polygon id="cropPoly" points=""></polygon>
+        <g id="cropHandles"></g>
+      </svg>
+    </div>
+    <div id="edBusy" class="busy" hidden><span class="spinner"></span></div>
+  </div>
+  <div id="edTools" class="ed-tools">
+    <div id="filterChips" class="chips" role="group" aria-label="Filter"></div>
+    <div class="tool-row">
+      <button id="btnMoveUp" class="tool" type="button">‹ Earlier</button>
+      <button id="btnCrop" class="tool" type="button">Crop</button>
+      <button id="btnRotate" class="tool" type="button">Rotate</button>
+      <button id="btnMoveDown" class="tool" type="button">Later ›</button>
+    </div>
+  </div>
+  <div id="cropBar" class="ed-tools" hidden>
+    <p class="crop-hint">Drag the four corners onto the page edges.</p>
+    <div class="tool-row">
+      <button id="btnCropAuto" class="tool" type="button">Detect</button>
+      <button id="btnCropFull" class="tool" type="button">Whole photo</button>
+      <button id="btnCropCancel" class="tool" type="button">Cancel</button>
+      <button id="btnCropApply" class="tool tool-primary" type="button">Apply</button>
+    </div>
+  </div>
+</section>
+
+<!-- Save sheet -->
+<div id="saveSheet" class="sheet-backdrop" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="saveH">
+    <h2 id="saveH">Save batch</h2>
+    <label class="field" for="saveName">
+      <span class="lab">File name</span>
+      <input id="saveName" autocomplete="off" spellcheck="false">
+    </label>
+    <p id="saveInfo" class="meta-line">Making the PDF…</p>
+    <div id="saveActions" class="sheet-actions">
+      <button id="btnShare" class="btn btn-big btn-pen btn-block" type="button" disabled>Save to Drive</button>
+      <p id="saveHelp" class="help">In the share list, tap <strong>Drive</strong>, then choose Audit Inbox and the client's folder.</p>
+      <button id="btnDownload" class="btn btn-line btn-block" type="button" disabled>Save to phone instead</button>
+      <button id="btnSaveCancel" class="btn btn-quiet btn-block" type="button">Cancel</button>
+    </div>
+    <div id="saveDone" class="sheet-actions" hidden>
+      <p id="saveDoneText" class="done-text"></p>
+      <button id="btnNewBatch" class="btn btn-big btn-pen btn-block" type="button">Finish and start a new batch</button>
+      <button id="btnKeepBatch" class="btn btn-line btn-block" type="button">Keep this batch open</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+<script src="db.js"></script>
+<script src="pdf.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

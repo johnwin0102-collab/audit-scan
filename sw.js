@@ -1,0 +1,64 @@
+/* Audit Scan offline cache. Bump VERSION on every release so phones pick up the update. */
+const VERSION = "1.0.0";
+const CACHE = "audit-scan-" + VERSION;
+const APP = [
+  "./",
+  "index.html",
+  "styles.css",
+  "app.js",
+  "db.js",
+  "pdf.js",
+  "cv-worker.js",
+  "manifest.webmanifest",
+  "fonts/atkinson-hyperlegible-latin-400-normal.woff2",
+  "fonts/atkinson-hyperlegible-latin-700-normal.woff2",
+  "fonts/barlow-condensed-latin-600-normal.woff2",
+  "fonts/barlow-condensed-latin-700-normal.woff2",
+  "fonts/ibm-plex-mono-latin-500-normal.woff2",
+  "icons/icon-192.png",
+  "icons/icon-512.png",
+  "icons/icon-maskable-512.png",
+  "icons/apple-touch-icon.png",
+];
+const ENGINE = "vendor/opencv.js";   // large and unchanging; the browser's own cache copy is fine
+
+self.addEventListener("install", (event) => {
+  event.waitUntil((async () => {
+    const cache = await caches.open(CACHE);
+    await cache.addAll(APP.map((u) => new Request(u, { cache: "reload" })));
+    await cache.add(ENGINE);
+  })());
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil((async () => {
+    const keys = await caches.keys();
+    await Promise.all(keys.filter((k) => k.startsWith("audit-scan-") && k !== CACHE).map((k) => caches.delete(k)));
+    await self.clients.claim();
+  })());
+});
+
+self.addEventListener("message", (event) => {
+  if (event.data === "skipWaiting") self.skipWaiting();
+});
+
+self.addEventListener("fetch", (event) => {
+  const req = event.request;
+  if (req.method !== "GET") return;
+  const url = new URL(req.url);
+  if (url.origin !== self.location.origin) return;
+  event.respondWith((async () => {
+    const cache = await caches.open(CACHE);
+    const hit = await cache.match(req, { ignoreSearch: true });
+    if (hit) return hit;
+    try {
+      return await fetch(req);
+    } catch (err) {
+      if (req.mode === "navigate") {
+        const shell = await cache.match("index.html");
+        if (shell) return shell;
+      }
+      throw err;
+    }
+  })());
+});
