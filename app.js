@@ -4,7 +4,7 @@
 "use strict";
 
 (() => {
-  const VERSION = "1.3";
+  const VERSION = "1.3.1";
 
   const AREAS = [
     { value: "Mixed", label: "Mixed (Claude sorts)", short: "" },
@@ -202,7 +202,7 @@
      canvas that's kept in main memory is slow (the whole frame has to come off the GPU first), so the
      picture is shrunk on the GPU and only the small result is read back. Phones differ, so the first
      frames are timed both ways and the faster way is kept. */
-  const stats = { grabMs: 0, mlMs: 0, rtMs: 0, looks: 0, lookHz: 0, since: 0, way: "", pageMs: 0, liveMs: 0, liveHz: 0, aiHz: 0 };
+  const stats = { grabMs: 0, mlMs: 0, rtMs: 0, looks: 0, lookHz: 0, since: 0, way: "", pageMs: 0, liveMs: 0, liveHz: 0, aiHz: 0, camHz: 0 };
   const ema = (prev, x) => (prev ? prev * 0.9 + x * 0.1 : x);
   function makeGrabber(w, h) {
     return {
@@ -254,9 +254,15 @@
   /* ---------- Live outline worker ----------
      Every camera frame goes to live-worker.js, which snaps the outline to the paper's edges in it and asks
      the AI page finder (through a MessagePort, so the page isn't involved) where the page is. Frames go as
-     VideoFrames, copied in the worker, when that shows the same picture as the screen; otherwise the page
-     draws each frame small and sends the picture. */
-  const tracker = { worker: null, state: "off", linked: false, path: "", busy: false, seq: 0, epoch: 0, sentFrame: -1, sentAt: 0, src: "", vfFails: 0, stalls: 0 };
+     VideoFrames when the worker can read them as the screen shows them (it copies or draws them, whichever
+     works and is quicker on this phone); otherwise as stills of the video, or as small pictures the page
+     draws itself. The worker also draws the camera view, each frame with its own outline (syncView). */
+  const tracker = {
+    worker: null, state: "off", linked: false, path: "", busy: false, seq: 0, epoch: 0, sentFrame: -1, sentAt: 0, src: "", vfFails: 0, stalls: 0,
+    view: "",          // "sent": the preview canvas has been handed to the worker
+    noSync: !!window.__auditScanNoSync,   // the worker doesn't draw the view on this phone (tests can ask for that too)
+    syncFails: 0,      // times the drawn view stopped and the video was shown instead
+  };
   function startTracker() {
     if (tracker.worker || tracker.state === "failed") return;
     try { tracker.worker = new Worker("live-worker.js"); }
@@ -266,6 +272,7 @@
       e.preventDefault();
       console.error("The live outline stopped", e.message || e);
       tracker.state = "failed"; tracker.busy = false; tracker.src = "";
+      cam.synced = false; showSynced(false);
     };
     tracker.state = "ready";
     linkFinder();
@@ -281,13 +288,13 @@
     const s = TRACK_EDGE / Math.max(v.videoWidth, v.videoHeight);
     trackGrab.size(Math.max(16, Math.round(v.videoWidth * s)), Math.max(16, Math.round(v.videoHeight * s)));
   }
-  // Is a VideoFrame copy the same picture as the video (same way up, same framing)? The worker compares
-  // one with a drawn copy of the same frame.
+  // Can VideoFrames be read in the worker as the screen shows them (same way up, same framing)? The worker
+  // compares its copy and its drawing of one with the same frame drawn by the page.
   function checkFramePath(v) {
-    if (window.__auditScanForcePath) { tracker.path = window.__auditScanForcePath; return; }   // tests
+    if (window.__auditScanForcePath) { tracker.path = window.__auditScanForcePath; syncView(true); return; }   // tests
     let f = null;
     if (typeof VideoFrame === "function") { try { f = new VideoFrame(v); } catch (_) { f = null; } }
-    if (!f) { tracker.path = "canvas"; return; }
+    if (!f) { tracker.path = "canvas"; syncView(true); return; }
     trackSize(v);
     const { img } = trackGrab.grab(v, false);
     tracker.busy = true;
@@ -296,8 +303,16 @@
       tracker.worker.postMessage({ type: "check", epoch: tracker.epoch, frame: f, rgba: img.data.buffer, w: trackGrab.w, h: trackGrab.h }, [f, img.data.buffer]);
     } catch (_) {
       try { f.close(); } catch (_e) { /* gone */ }
-      tracker.busy = false; tracker.path = "canvas";
+      tracker.busy = false; tracker.path = "canvas"; syncView(true);
     }
+  }
+  // With the worker drawing the view but VideoFrames unusable: a still of each frame, at about the size it's
+  // shown (never smaller than the outline's picture), goes to the worker, which finds the outline in it and
+  // shows it with that outline.
+  function stillSize(v) {
+    const vw = v.videoWidth, vh = v.videoHeight;
+    const k = Math.min(1, Math.max(Math.min(cam.viewW / vw, cam.viewH / vh) || 0, TRACK_EDGE / Math.max(vw, vh)));
+    return { resizeWidth: Math.max(16, Math.round(vw * k)), resizeHeight: Math.max(16, Math.round(vh * k)), resizeQuality: "medium" };
   }
   function sendFrame(v) {
     if (tracker.busy || live.frame === tracker.sentFrame) return;
@@ -314,11 +329,25 @@
     }
     // Drawing frames costs the page time: on a phone where it's slow, draw fewer of them.
     if (stats.grabMs > 12 && performance.now() - tracker.sentAt < stats.grabMs * 2.5) return;
-    trackSize(v);
-    const { img, dt } = trackGrab.grab(v, true);
-    stats.grabMs = ema(stats.grabMs, dt);
     tracker.busy = true; tracker.sentFrame = live.frame; tracker.sentAt = performance.now();
-    tracker.worker.postMessage({ type: "frame", seq, cf: live.frame, epoch: tracker.epoch, rgba: img.data.buffer, w: trackGrab.w, h: trackGrab.h }, [img.data.buffer]);
+    if (!cam.synced) {
+      trackSize(v);
+      const { img, dt } = trackGrab.grab(v, true);
+      stats.grabMs = ema(stats.grabMs, dt);
+      tracker.worker.postMessage({ type: "frame", seq, cf: live.frame, epoch: tracker.epoch, rgba: img.data.buffer, w: trackGrab.w, h: trackGrab.h }, [img.data.buffer]);
+      return;
+    }
+    const epoch = tracker.epoch, cf = live.frame, t0 = performance.now();
+    createImageBitmap(v, stillSize(v)).then((still) => {
+      stats.grabMs = ema(stats.grabMs, performance.now() - t0);
+      if (epoch !== tracker.epoch || !tracker.worker) { still.close(); return; }
+      try { tracker.worker.postMessage({ type: "frame", seq, cf, epoch, still }, [still]); }
+      catch (_) { still.close(); tracker.busy = false; }
+    }, () => {
+      // this phone can't take stills of the video: show the video itself, and draw frames as before
+      if (epoch === tracker.epoch) tracker.busy = false;
+      noSync();
+    });
   }
   function onTrackerMsg(e) {
     const m = e.data || {};
@@ -326,17 +355,22 @@
     if (m.type === "check") {
       tracker.busy = false;
       tracker.path = m.ok ? "frame" : "canvas";
-      if (m.ok) stats.way = "frame";
+      syncView(true);
       pump();
       return;
     }
     if (m.type !== "quad") return;
     tracker.busy = false;
-    if (m.fallback) tracker.path = "canvas";         // this phone's frames can't be copied: draw them instead
+    // This phone's frames can't be read in the worker: stills of the video instead, and if even those can't,
+    // the page draws each frame small itself (and the video shows the camera).
+    if (m.fallback) { if (tracker.path === "canvas") noSync(); tracker.path = "canvas"; }
+    if (m.drawn) { cam.drawnAt = performance.now(); cam.drawN++; if (cam.synced) showSynced(true); }
+    else if (!cam.synced) resync();
     if (m.sig) cam.sig = m.sig;
     if (m.stats) {
       stats.liveMs = m.stats.liveMs; stats.liveHz = m.stats.liveHz; stats.aiHz = m.stats.aiHz;
       if (m.stats.aiMs) stats.mlMs = m.stats.aiMs;
+      if (m.stats.way) stats.way = m.stats.way;
     }
     stats.rtMs = ema(stats.rtMs, performance.now() - tracker.sentAt);
     tracker.src = m.src || "";
@@ -356,6 +390,77 @@
     pump();                                          // a newer frame may be waiting
   }
   function setEase() { if (tracker.worker) tracker.worker.postMessage({ type: "ease", on: cam.inFlight > 0 }); }
+
+  // The camera view drawn by the worker, frame by frame with that frame's outline, so the outline stays on
+  // the page as shown even while the hand shakes. Where that can't be done (or stops working), the video
+  // element shows the camera and the outline is drawn over it.
+  function syncView(on) {
+    on = !!on && !tracker.noSync && tracker.state === "ready" && typeof el.preview.transferControlToOffscreen === "function" &&
+      (tracker.path === "frame" || typeof createImageBitmap === "function");
+    if (on && tracker.view !== "sent") {
+      try {
+        const oc = el.preview.transferControlToOffscreen();
+        tracker.worker.postMessage({ type: "view", canvas: oc, dpr: viewDpr() }, [oc]);
+        tracker.view = "sent";
+      } catch (_) { tracker.noSync = true; on = false; }
+    }
+    if (on === cam.synced) return;
+    cam.synced = on;
+    cam.viewW = cam.viewH = 0;
+    cam.syncAt = performance.now(); cam.drawnAt = 0; cam.okRun = 0;
+    cam.rate = { at: cam.syncAt, frame: live.frame, slow: 0 }; cam.drawN = 0;
+    if (on) {
+      sizeView();   // (the drawn view replaces the video once the worker has drawn a frame: showSynced)
+      tracker.worker.postMessage({ type: "look", steady: cam.showSteady });
+    }
+    else {
+      if (tracker.view === "sent" && tracker.worker) tracker.worker.postMessage({ type: "view-off" });
+      showSynced(false);
+    }
+  }
+  function showSynced(on) {
+    if (cam.viewing === on) return;
+    cam.viewing = on;
+    el.scrCamera.classList.toggle("synced", on);
+    drawQuad(on ? null : cam.shown, cam.showSteady);
+  }
+  function noSync() { tracker.noSync = true; syncView(false); }
+  // After the drawn view stalled (the phone was busy, say) and the video was shown instead: back to the
+  // drawn view once the outline keeps up with the camera again.
+  function resync() {
+    if (tracker.noSync || !tracker.syncFails || cam.synced || !cam.stream) return;
+    const now = performance.now();
+    cam.okRun = cam.lastAnswer && now - cam.lastAnswer < 70 ? (cam.okRun || 0) + 1 : 0;
+    cam.lastAnswer = now;
+    if (cam.okRun >= 20) syncView(true);
+  }
+  // Called every screen refresh while the worker draws the view: if its drawing stops, the video is shown
+  // instead; if it can't keep up with the camera at all on this phone, the video is shown from then on.
+  function watchSync(now) {
+    if (!cam.stream || S.screen !== "camera" || document.hidden) { cam.syncAt = now; return; }
+    if (now - Math.max(cam.drawnAt, cam.syncAt) > (cam.drawnAt ? 700 : 2500)) {
+      if (++tracker.syncFails >= 3) noSync(); else syncView(false);
+      return;
+    }
+    const w = cam.rate;
+    if (now - w.at < 2000) return;
+    const s = (now - w.at) / 1000, drawn = cam.drawN / s, camHz = (live.frame - w.frame) / s;
+    // Too slow: fewer than half the camera's frames get drawn (and under 15 a second), or frames come far slower
+    // than the camera is set to give them (the hidden video may be held back on some phones). Not while pages
+    // are being processed: that takes cores for a moment.
+    w.slow = drawn < Math.min(15, 0.5 * camHz) || (drawn < 12 && cam.fps >= 24 && camHz < 12) ? (cam.inFlight === 0 ? w.slow + 1 : w.slow) : 0;
+    w.at = now; w.frame = live.frame; cam.drawN = 0;
+    if (w.slow >= 2) noSync();
+  }
+  const viewDpr = () => Math.min(window.devicePixelRatio || 1, 2.5);
+  function sizeView() {
+    if (!cam.synced) return;
+    const r = el.video.getBoundingClientRect(), d = viewDpr();
+    const w = Math.max(16, Math.round(r.width * d)), h = Math.max(16, Math.round(r.height * d));
+    if (w === cam.viewW && h === cam.viewH) return;
+    cam.viewW = w; cam.viewH = h;
+    tracker.worker.postMessage({ type: "view-size", w, h, dpr: d });
+  }
 
   async function finderDetect(img) {
     const t0 = performance.now();
@@ -487,9 +592,11 @@
   // Footer: version, and once the camera has run, how fast the page finder is on this phone.
   function renderVersion() {
     let t = `Version ${VERSION}.`;
+    if (cam.res && stats.camHz) t += ` Camera: ${cam.res}, ${Math.round(stats.camHz)} frames a second.`;
     if (stats.liveHz) {
       const n = finder.info.threads || 1;
-      t += ` Outline: ${Math.round(stats.liveHz)} updates a second, ${Math.round(stats.liveMs || 0)} ms each (${stats.way || "?"}).`;
+      const view = tracker.view === "sent" ? (cam.synced ? ", view in step" : tracker.noSync ? ", video view" : ", view paused") : "";
+      t += ` Outline: ${Math.round(stats.liveHz)} updates a second, ${Math.round(stats.liveMs || 0)} ms each (${stats.way || "?"}${view}).`;
       if (stats.mlMs) t += ` AI: ${plural(n, "core", "cores")}, ${Math.round(stats.mlMs)} ms a look, ${Math.round(stats.aiHz || 0)} a second.`;
     } else if (stats.rtMs) {
       const n = finder.info.threads || 1;
@@ -634,12 +741,16 @@
     lastQuad: null, lastQuadAt: 0, shown: null, showSteady: false, lastAnim: 0, anchor: null, steadySince: 0, misses: 0,
     armed: true, capturedSig: null, capturedAt: 0, sig: null, inFlight: 0, starting: false,
     target: null, motion: { q: null, f: -1, v: null },
+    // the view drawn by the live outline worker: on, its size (device px), when it was switched on, when the
+    // worker last drew a frame, frames drawn since rate.at, answers in a row that kept up with the camera
+    synced: false, viewing: false, viewW: 0, viewH: 0, syncAt: 0, drawnAt: 0, drawN: 0, rate: { at: 0, frame: 0, slow: 0 }, okRun: 0, lastAnswer: 0,
+    fps: 0,   // frames a second the camera is set to give
   };
   // Live page finding: every new camera frame goes to the live outline worker (or, if that worker isn't
   // running, the AI finder looks at every frame it can keep up with); the classical edge finder runs
   // alongside, a few times a second, only while the AI sees no page.
   const live = {
-    frame: 0, vfc: 0, watching: false, useRaf: false,
+    frame: 0, vfc: 0, watching: false, useRaf: false, rateAt: 0, rateFrame: 0,
     mlBusy: false, mlFrame: -1, mlQuad: null, mlLast: 0,
     cvBusy: false, cvFrame: -1, cvQuad: null, cvAt: 0, cvLast: 0,
   };
@@ -683,6 +794,7 @@
         setTimeout(res, 3000);
       });
       sizeOverlay();
+      sizeView();
       trackFeatures();
       requestWakeLock();
       resetDetection();
@@ -719,6 +831,7 @@
     }
     const s = (cam.track && cam.track.getSettings && cam.track.getSettings()) || {};
     cam.res = `${s.width || el.video.videoWidth}×${s.height || el.video.videoHeight}`;
+    cam.fps = s.frameRate || 0;
   }
 
   function stopCamera() {
@@ -745,6 +858,7 @@
     live.mlQuad = null; live.cvQuad = null; live.cvAt = 0;
     tracker.epoch++; tracker.busy = false; tracker.sentFrame = -1; tracker.src = "";
     cam.motion = { q: null, f: -1, v: null };
+    cam.syncAt = performance.now(); cam.drawnAt = 0; cam.drawN = 0; cam.rate = { at: cam.syncAt, frame: live.frame, slow: 0 };
     if (tracker.worker) tracker.worker.postMessage({ type: "reset" });
     euroReset();
     drawQuad(null, false);
@@ -802,7 +916,7 @@
       tracker.busy = false;
       tracker.stalls++;
       if (tracker.stalls >= 2) tracker.path = "canvas";
-      if (tracker.stalls >= 4) { tracker.state = "failed"; tracker.src = ""; }
+      if (tracker.stalls >= 4) { tracker.state = "failed"; tracker.src = ""; noSync(); }
     }
     if (tracker.state === "ready") sendFrame(v);
     else legacyLook(v, now);
@@ -905,6 +1019,13 @@
   function animate(now) {
     cam.raf = requestAnimationFrame(animate);
     if (live.useRaf) { live.frame++; pump(); }
+    if (cam.synced) watchSync(now);
+    // camera frames a second (shown in the footer)
+    if (!live.rateAt || live.frame < live.rateFrame) { live.rateAt = now; live.rateFrame = live.frame; }
+    else if (now - live.rateAt >= 2000) {
+      stats.camHz = ema(stats.camHz, ((live.frame - live.rateFrame) * 1000) / (now - live.rateAt));
+      live.rateAt = now; live.rateFrame = live.frame;
+    }
     const dt = cam.lastAnim ? Math.min(100, now - cam.lastAnim) : 16;
     cam.lastAnim = now;
     let target = cam.lastQuad ? cam.target : null;
@@ -920,6 +1041,7 @@
     if (!cam.shown) cam.shown = target.map((p) => p.slice());
     else if (maxDelta(cam.shown, target) > 0.0002) cam.shown = lerpQuad(cam.shown, target, TUNE.showMs > 0 ? 1 - Math.exp(-dt / TUNE.showMs) : 1);
     else if (cam.drawnSteady === cam.showSteady) return;
+    if (cam.synced && cam.drawnSteady !== cam.showSteady) tracker.worker.postMessage({ type: "look", steady: cam.showSteady });
     cam.drawnSteady = cam.showSteady;
     drawQuad(cam.shown, cam.showSteady);
   }
@@ -986,7 +1108,7 @@
   }
 
   function drawQuad(q, steady) {
-    if (!q) { el.quadPoly.setAttribute("points", ""); return; }
+    if (!q || cam.viewing) { el.quadPoly.setAttribute("points", ""); return; }
     const W = el.video.videoWidth || 1, H = el.video.videoHeight || 1;
     el.quadPoly.setAttribute("points", q.map(([x, y]) => `${(x * W).toFixed(1)},${(y * H).toFixed(1)}`).join(" "));
     el.quadPoly.classList.toggle("steady", steady);
@@ -1704,7 +1826,7 @@
     const ids = [
       "scrSetup", "scrCamera", "scrReview", "scrEditor", "engineChip", "updateBar", "btnUpdate", "batchForm", "batchState",
       "client", "clientList", "fye", "area", "note", "formMsg", "btnStart", "openBatch", "openSummary", "btnOpenReview",
-      "btnDiscard", "savedList", "savedEmpty", "savedSum", "verText", "video", "overlay", "quadPoly", "flash", "hint",
+      "btnDiscard", "savedList", "savedEmpty", "savedSum", "verText", "video", "preview", "overlay", "quadPoly", "flash", "hint",
       "camError", "camErrorText", "btnRetryCam", "btnCamBack", "camLabel", "btnTorch", "btnAuto", "btnThumb", "thumbImg",
       "pageCount", "btnShutter", "ringArc", "btnDone", "btnReviewBack", "reviewMeta", "reviewEmpty", "grid", "btnAddPages",
       "importInput", "btnSave", "btnEdBack", "edTitle", "edMeta", "btnEdDelete", "edImg", "cropWrap", "cropImg", "cropSvg",
@@ -1770,7 +1892,7 @@
     el.cropSvg.addEventListener("pointermove", onCropMove);
     el.cropSvg.addEventListener("pointerup", onCropUp);
     el.cropSvg.addEventListener("pointercancel", onCropUp);
-    window.addEventListener("resize", () => { if (S.editor && S.editor.crop) drawCrop(); });
+    window.addEventListener("resize", () => { if (S.editor && S.editor.crop) drawCrop(); sizeView(); });
 
     el.btnShare.addEventListener("click", shareToDrive);
     el.btnDownload.addEventListener("click", downloadPdf);
@@ -1811,9 +1933,9 @@
   // Read by the automated tests; debugSlow makes the AI and the live outline take longer, like a slower phone.
   window.__auditScan = {
     S, engine, finder, cam, live, stats, tracker, TUNE,
-    debugSlow(mlMs, liveMs, trace) {
-      if (finder.worker) finder.worker.postMessage({ type: "debug", minMs: mlMs || 0 });
-      if (tracker.worker) tracker.worker.postMessage({ type: "debug", liveMs: liveMs || 0, trace: !!trace });
+    debugSlow(mlMs, liveMs, trace, fuzz, read) {
+      if (finder.worker) finder.worker.postMessage({ type: "debug", minMs: mlMs || 0, fuzz: fuzz || null });
+      if (tracker.worker) tracker.worker.postMessage({ type: "debug", liveMs: liveMs || 0, trace: !!trace, read: read || "" });
       if (trace) tracker.trace = [];
     },
   };

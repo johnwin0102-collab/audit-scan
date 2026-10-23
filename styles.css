@@ -158,6 +158,11 @@ label.btn:focus-within { outline: 3px solid var(--pen); outline-offset: 2px; }
 .camera { position: fixed; inset: 0; height: 100dvh; overflow: hidden; background: var(--cam-bg); color: var(--cam-ink); touch-action: manipulation; }
 .cam-stage { position: absolute; inset: 0; }
 #video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: var(--cam-bg); }
+/* The live outline worker draws the camera view here, each frame with its own outline. */
+#preview { position: absolute; inset: 0; width: 100%; height: 100%; display: none; background: var(--cam-bg); }
+.camera.synced #preview { display: block; }
+.camera.synced #video { opacity: 0; }
+.camera.synced #overlay { display: none; }
 .overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 #quadPoly { fill: var(--quad-fill); stroke: var(--quad); stroke-width: 3; vector-effect: non-scaling-stroke; stroke-linejoin: round; transition: fill .15s, stroke .15s; }
 #quadPoly.steady { fill: var(--quad-ok-fill); stroke: var(--quad-ok); }

@@ -15,6 +15,19 @@ const THREADS = self.crossOriginIsolated ? Math.max(1, Math.min(3, Math.floor((n
 
 let session = null;
 let minMs = 0;     // test hook: make each look take at least this long (a slower phone)
+let fuzz = null;   // test hook: make the answers less exact, like the AI on harder real pages
+function fuzzed(quad) {
+  const F = fuzz;
+  const rnd = () => { F.seed = (F.seed * 48271) % 2147483647; return F.seed / 2147483647; };
+  const gauss = () => { let u = 0; while (u === 0) u = rnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rnd()); };
+  if (!F.bias) F.bias = [0, 1, 2, 3].map(() => { const a = rnd() * 2 * Math.PI; return [Math.cos(a) * F.b / 100, Math.sin(a) * F.b / 100]; });
+  const wild = rnd() < F.o;
+  return quad.map(([x, y], i) => {
+    let nx = x + F.bias[i][0] + (gauss() * F.n) / 100, ny = y + F.bias[i][1] + (gauss() * F.n) / 100;
+    if (wild) { nx += (rnd() - 0.5) * 0.12; ny += (rnd() - 0.5) * 0.12; }
+    return [Math.min(1, Math.max(0, nx)), Math.min(1, Math.max(0, ny))];
+  });
+}
 
 const ready = (async () => {
   ort.env.wasm.wasmPaths = new URL("./vendor/ml/", self.location.href).href;
@@ -50,7 +63,8 @@ async function detect(buffer) {
   if (minMs) { const wait = minMs - (performance.now() - t0); if (wait > 0) await new Promise((r) => setTimeout(r, wait)); }
   const ms = performance.now() - t0;
   if (!coords) return { quad: null, score: 0, ms };
-  const quad = [0, 1, 2, 3].map((i) => [Math.min(1, Math.max(0, coords[2 * i])), Math.min(1, Math.max(0, coords[2 * i + 1]))]);
+  let quad = [0, 1, 2, 3].map((i) => [Math.min(1, Math.max(0, coords[2 * i])), Math.min(1, Math.max(0, coords[2 * i + 1]))]);
+  if (fuzz) quad = fuzzed(quad);
   const score = logit === null ? 1 : 1 / (1 + Math.exp(-logit));
   return { quad, score, ms };
 }
@@ -79,6 +93,10 @@ self.onmessage = (event) => {
     port.onmessage = (e) => handle(e.data || {}, (r) => port.postMessage(r));
     return;
   }
-  if (msg.type === "debug") { minMs = msg.minMs || 0; return; }
+  if (msg.type === "debug") {
+    minMs = msg.minMs || 0;
+    fuzz = msg.fuzz ? { b: msg.fuzz.bias || 0, n: msg.fuzz.noise || 0, o: msg.fuzz.outlier || 0, seed: 12345 } : null;
+    return;
+  }
   handle(msg, (r) => self.postMessage(r));
 };

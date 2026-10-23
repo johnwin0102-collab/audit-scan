@@ -1,5 +1,5 @@
 /* Audit Scan offline cache. Bump VERSION on every release so phones pick up the update. */
-const VERSION = "1.3";
+const VERSION = "1.3.1";
 const CACHE = "audit-scan-" + VERSION;
 const APP = [
   "./",

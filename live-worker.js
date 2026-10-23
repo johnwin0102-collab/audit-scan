@@ -21,6 +21,7 @@ function sizeGrey(w, h) {
     gw = nw; gh = nh;
     grey = new Float32Array(gw * gh);
     blurTmp = new Float32Array(gw * gh);
+    mo.prev = null;
     trk.reset();
   }
 }
@@ -170,11 +171,24 @@ function fromPlanes(buf, layout, format, vw, vh, cs, wantAI) {
   return out;
 }
 
-// Grey picture (and AI picture) from an RGBA picture of the whole frame drawn by the page.
-function fromRGBA(px, w, h, wantAI) {
-  sizeGrey(w, h);
-  if (w !== gw || h !== gh) throw new Error("Unexpected picture size");
-  for (let i = 0, j = 0; i < gw * gh; i++, j += 4) grey[i] = 0.299 * px[j] + 0.587 * px[j + 1] + 0.114 * px[j + 2];
+// Grey picture (and AI picture) from an RGBA picture of the whole frame: the grey picture's size, or (k = 2)
+// twice that each way, averaged down (finer edges than a picture shrunk straight to size).
+function fromRGBA(px, w, h, wantAI, k = 1) {
+  sizeGrey(w / k, h / k);
+  if (w !== gw * k || h !== gh * k) throw new Error("Unexpected picture size");
+  if (k === 1) {
+    for (let i = 0, j = 0; i < gw * gh; i++, j += 4) grey[i] = 0.299 * px[j] + 0.587 * px[j + 1] + 0.114 * px[j + 2];
+  } else {
+    const rs = w * 4;
+    for (let y = 0; y < gh; y++) {
+      const r0 = 2 * y * rs, r1 = r0 + rs, o = y * gw;
+      for (let x = 0, c = 0; x < gw; x++, c += 8) {
+        const p = r0 + c, q = r1 + c;
+        grey[o + x] = 0.25 * (0.299 * (px[p] + px[p + 4] + px[q] + px[q + 4]) + 0.587 * (px[p + 1] + px[p + 5] + px[q + 1] + px[q + 5]) +
+          0.114 * (px[p + 2] + px[p + 6] + px[q + 2] + px[q + 6]));
+      }
+    }
+  }
   blur3(grey, gw, gh);
   if (!wantAI) return null;
   const out = new Uint8ClampedArray(AI * AI * 4);
@@ -221,6 +235,7 @@ const okv = new Uint8Array(prof.length);
 const resp = [new Float64Array(prof.length), new Float64Array(prof.length)];
 const OUTER = 0.6;   // an edge further out wins if it's at least this strong compared with the strongest
 const tk = new Float64Array(K), offs = [new Float64Array(K), new Float64Array(K)], good = [new Uint8Array(K), new Uint8Array(K)];
+const vals = [new Float64Array(K), new Float64Array(K)];
 for (let k = 0; k < K; k++) tk[k] = 0.07 + (0.86 * k) / (K - 1);
 
 function bil(x, y) {
@@ -286,8 +301,9 @@ function fitLine(sign, out) {
   return bestN;
 }
 
-// One side, P0 -> P1 in grey px, page centre (cx, cy). Returns null, or where the edge found starts and
-// ends with its direction at each end: [sx, sy, ex, ey, dsx, dsy, dex, dey].
+// One side, P0 -> P1 in grey px, page centre (cx, cy). Returns null, or { l, frac, str }: where the edge
+// found starts and ends with its direction at each end (l = [sx, sy, ex, ey, dsx, dsy, dex, dey]), the
+// share of the side it was found along, and how strong a step it is (grey levels).
 function snapSide(P0x, P0y, P1x, P1y, cx, cy, R) {
   const dx = P1x - P0x, dy = P1y - P0y, L = Math.hypot(dx, dy) || 1e-9;
   let nx = -dy / L, ny = dx / L;
@@ -337,6 +353,7 @@ function snapSide(P0x, P0y, P1x, P1y, cx, cy, R) {
       const jb = sign === 0 ? j0 : j1, val = sign === 0 ? best0 : best1;
       if (jb < 0 || val <= T_STEP) { good[sign][k] = 0; continue; }
       good[sign][k] = 1;
+      vals[sign][k] = val;
       let off = jb - R - MM;
       if (jb > MM && jb < MM + 2 * R) {
         const sg = sign === 0 ? 1 : -1;
@@ -349,10 +366,19 @@ function snapSide(P0x, P0y, P1x, P1y, cx, cy, R) {
   }
   const f0 = {}, f1 = {};
   const n0 = fitLine(0, f0), n1 = fitLine(1, f1);
-  const f = n0 >= n1 ? f0 : f1, n = Math.max(n0, n1);
+  const f = n0 >= n1 ? f0 : f1, n = Math.max(n0, n1), sg = n0 >= n1 ? 0 : 1;
   if (n < Math.max(6, 0.45 * K)) return null;
+  let sum = 0, cnt = 0;
+  for (let k = 0; k < K; k++) {
+    if (!good[sg][k]) continue;
+    const u = tk[k] - 0.5;
+    if (Math.abs(offs[sg][k] - (f.a + f.b * u + f.c * (u * u - 1 / 12))) < INL) { sum += vals[sg][k]; cnt++; }
+  }
   const o0 = f.a - 0.5 * f.b + f.c / 6, o1 = f.a + 0.5 * f.b + f.c / 6, g0 = f.b - f.c, g1 = f.b + f.c;
-  return [P0x + o0 * nx, P0y + o0 * ny, P1x + o1 * nx, P1y + o1 * ny, dx + g0 * nx, dy + g0 * ny, dx + g1 * nx, dy + g1 * ny];
+  return {
+    l: [P0x + o0 * nx, P0y + o0 * ny, P1x + o1 * nx, P1y + o1 * ny, dx + g0 * nx, dy + g0 * ny, dx + g1 * nx, dy + g1 * ny],
+    frac: n / K, str: cnt ? sum / cnt : 0,
+  };
 }
 
 function intersect(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1) {
@@ -387,15 +413,19 @@ function onBorder(a, b, tol = 1.5) {
     (a[0] >= gw - tol && b[0] >= gw - tol) || (a[1] >= gh - tol && b[1] >= gh - tol);
 }
 
-// Returns { q, sides, ok } in grey px; q is the input unchanged when the snap isn't trustworthy.
+// Returns { q, sides, ok, score } in grey px; q is the input unchanged when the snap isn't trustworthy.
+// score: how well the outline sits on paper edges (0 to 4: each side's share on an edge, weighed by how
+// clear the edge is).
+const NONE = { sides: 0, ok: [false, false, false, false], score: 0 };
 function snapQuad(Q, R) {
   const cx = (Q[0][0] + Q[1][0] + Q[2][0] + Q[3][0]) / 4, cy = (Q[0][1] + Q[1][1] + Q[2][1] + Q[3][1]) / 4;
   const lines = [], ok = [false, false, false, false];
-  let sides = 0;
+  let sides = 0, score = 0;
   for (let i = 0; i < 4; i++) {
     const a = Q[i], b = Q[(i + 1) % 4];
     const s = onBorder(a, b) ? null : snapSide(a[0], a[1], b[0], b[1], cx, cy, R);
-    if (s) { sides++; ok[i] = true; lines.push(s); } else lines.push([a[0], a[1], b[0], b[1], b[0] - a[0], b[1] - a[1], b[0] - a[0], b[1] - a[1]]);
+    if (s) { sides++; ok[i] = true; lines.push(s.l); score += s.frac * Math.min(1, s.str / 30); }
+    else lines.push([a[0], a[1], b[0], b[1], b[0] - a[0], b[1] - a[1], b[0] - a[0], b[1] - a[1]]);
   }
   const out = [];
   const lim = R * 1.6 + 4;
@@ -403,25 +433,35 @@ function snapQuad(Q, R) {
     // corner i: where the end of side i-1 meets the start of side i
     const e = lines[(i + 3) % 4], st = lines[i];
     const p = intersect(e[2], e[3], e[2] + e[6], e[3] + e[7], st[0], st[1], st[0] + st[4], st[1] + st[5]);
-    if (!p || Math.abs(p[0] - Q[i][0]) > lim || Math.abs(p[1] - Q[i][1]) > lim) return { q: Q, sides: 0, ok: [false, false, false, false] };
+    if (!p || Math.abs(p[0] - Q[i][0]) > lim || Math.abs(p[1] - Q[i][1]) > lim) return { q: Q, ...NONE };
     out.push(p);
   }
-  if (!convex(out) || area(out) < 0.03 * gw * gh) return { q: Q, sides: 0, ok: [false, false, false, false] };
-  return { q: out, sides, ok };
+  if (!convex(out) || area(out) < 0.03 * gw * gh) return { q: Q, ...NONE };
+  return { q: out, sides, ok, score };
 }
 
 /* ---------- Tracker ---------- */
 const trk = {
   q: null, v: null, src: "", miss: 0, weak: 0, boost: 0, hist: new Map(), strong: 0, agreeAt: 0, cvAt: 0, differ: 0, cf: -1, jumped: false,
+  proposal: null,            // a finder's outline to try against the edges in the next frame
+  follow: null,              // with no edges to hold on to: the AI's outline the outline glides to ({ q, far })
+  moOk: 0,                   // camera frames in a row the outline has kept to the page (on edges, or with the print)
+  settled: false,            // the outline has been on the page (on its edges, or agreeing with the AI)
   sideOk: [0, 0, 0, 0],      // frames in a row each side has sat on an edge
   cfOf: new Map(),           // worker frame number -> camera frame number
   unsure: -1,                // last frame before which a stall happened, until the AI confirms the outline
-  reset() { this.q = null; this.v = null; this.src = ""; this.miss = 0; this.weak = 0; this.boost = 0; this.hist.clear(); this.strong = 0; this.differ = 0; this.cf = -1; this.sideOk = [0, 0, 0, 0]; this.unsure = -1; },
+  reset() { this.q = null; this.v = null; this.src = ""; this.miss = 0; this.weak = 0; this.boost = 0; this.hist.clear(); this.strong = 0; this.differ = 0; this.cf = -1; this.sideOk = [0, 0, 0, 0]; this.unsure = -1; this.proposal = null; this.follow = null; this.moOk = 0; this.settled = false; },
 };
 const ZERO = () => [[0, 0], [0, 0], [0, 0], [0, 0]];
 const toPx = (q) => q.map(([x, y]) => [x * gw, y * gh]);
 const toNorm = (q) => q.map(([x, y]) => [x / gw, y / gh]);
 
+// Largest distance between corresponding corners.
+function maxApart(A, B) {
+  let d = 0;
+  for (let i = 0; i < 4; i++) d = Math.max(d, Math.hypot(A[i][0] - B[i][0], A[i][1] - B[i][1]));
+  return d;
+}
 // Best corner correspondence between two quads (a finder may number the corners from another corner).
 function align(A, ref) {
   let best = null, bd = Infinity;
@@ -469,9 +509,28 @@ function onFinder(f, quad, src) {
     }
     ai.prev = { cf: cfF, q: A };
   }
-  // No edges to hold on to (white paper on a white desk, say): the outline just follows the AI.
+  // No edges to hold on to (white paper on a white desk, say): the outline follows the AI, moved on to now as
+  // the outline has moved since (see track: with the print on the page, or gliding).
   if (src === "ai" && trk.q && trk.weak >= 2) {
-    trk.q = align(Ax, trk.q).q; trk.src = src; trk.agreeAt = now; trk.v = ZERO();
+    // (moved on as the outline has moved since, when it has kept to the page all along, on edges or with the
+    // print; otherwise as the AI's own last two answers moved)
+    let T;
+    if (ref && trk.moOk >= trk.cf - cfF) { const m = align(A, ref).q; T = m.map((p, i) => [p[0] + trk.q[i][0] - ref[i][0], p[1] + trk.q[i][1] - ref[i][1]]); }
+    else T = align(Ax, trk.q).q;
+    trk.src = src; trk.agreeAt = now;
+    // An answer well away from the outline: the outline goes straight there; but once the outline has been on
+    // the page (on its edges, or agreeing with the AI), only when the answer before was well away too, so one
+    // odd answer doesn't throw it off. Either way, the next frame also looks for edges around the AI's outline.
+    const F = trk.follow, diag = Math.hypot(gw, gh), d = maxApart(T, trk.q);
+    if (d > 0.025 * diag) {
+      if (trk.settled && !(F && F.far)) { trk.follow = { q: F ? F.q : null, far: true }; return; }
+      trk.q = T; trk.v = ZERO(); trk.boost = 1; trk.jumped = true; trk.settled = false;
+      trk.follow = { q: T, far: true };
+    } else {
+      trk.follow = { q: T };
+      trk.settled = true;
+    }
+    trk.proposal = { q: T, d: d / diag, src };
     return;
   }
   if (trk.q && ref) {
@@ -487,17 +546,17 @@ function onFinder(f, quad, src) {
       if (src === "ai") { trk.agreeAt = now; if (trk.unsure >= 0 && f > trk.unsure) trk.unsure = -1; }
       return;
     }
-    // Further off than that: start again from the finder's outline, moved on by however far the tracked
-    // outline has moved since frame f. A firm outline waits for a second look that disagrees, so one odd
-    // AI answer doesn't throw it off.
-    if (src === "ai" && trk.src === "ai" && firm && ++trk.differ < 2) return;
-    trk.differ = 0;
-    if (firm || Ax === A) trk.q = m.q.map((p, i) => [p[0] + trk.q[i][0] - ref[i][0], p[1] + trk.q[i][1] - ref[i][1]]);
-    else trk.q = align(Ax, trk.q).q;
+    // The finder sees the page somewhere else. It isn't always right (a desk edge or a shadow can fool the AI
+    // by a few per cent), and the outline shouldn't be pulled to and fro: the next frame tries the finder's
+    // outline, moved on to now, against the paper's edges, and keeps whichever sits on them better.
+    const moved = firm || Ax === A ? m.q.map((p, i) => [p[0] + trk.q[i][0] - ref[i][0], p[1] + trk.q[i][1] - ref[i][1]]) : align(Ax, trk.q).q;
+    trk.proposal = { q: moved, d: m.d / diag, src };
+    trk.differ++;
+    return;
   } else {
     trk.q = Ax;
   }
-  trk.v = ZERO();
+  trk.v = ZERO(); trk.follow = null; trk.settled = false;
   trk.src = src; trk.boost = 2; trk.weak = 0; trk.strong = 0; trk.jumped = true;
   trk.sideOk = [0, 0, 0, 0];
   if (src === "ai") trk.agreeAt = now;
@@ -506,6 +565,7 @@ function onFinder(f, quad, src) {
 // f: frame number in this worker's sequence; cf: the camera's frame number (frames the page skipped count).
 function track(f, cf) {
   trk.cfOf.set(f, cf);
+  halfNow();
   if (trk.q && trk.src === "cv" && performance.now() - trk.cvAt > 700) trk.reset();   // classical find not confirmed
   if (!trk.q) { trk.hist.set(f, null); trk.cf = cf; prune(f); return null; }
   // Expect the outline where its recent motion (per camera frame) takes it, and look further the faster it moves.
@@ -524,16 +584,57 @@ function track(f, cf) {
   for (const d of v) vmax = Math.max(vmax, Math.abs(d[0]), Math.abs(d[1]));
   const R = Math.round(Math.min(RMAX, (trk.boost > 0 ? 22 : 12) + vmax * gap));
   if (trk.boost > 0) trk.boost--;
-  const { q, sides, ok } = snapQuad(pred, R);
+  let { q, sides, ok, score } = snapQuad(pred, R);
+  let jumped = false;
+  if (trk.proposal) {
+    const P = trk.proposal;
+    trk.proposal = null;
+    const alt = snapQuad(P.q, 22);
+    const diag = Math.hypot(gw, gh);
+    // (the page is the outermost thing: an outline around the current one, on edges nearly as clear, wins;
+    // the current one was probably on a table rule or the edge of the print)
+    const aq = area(q), aa = area(alt.q), inter = clipShare(q, alt.q) * aq, iou = inter / (aq + aa - inter);
+    const around = alt.sides >= 3 && aa > 1.03 * aq && inter > 0.97 * aq && alt.score >= 0.6 * score;
+    if (alt.sides >= 3 && sides >= 3 && (align(alt.q, q).d < 0.015 * diag || iou > 0.96)) {
+      // The finder's outline lands on the same edges: it was just off a little. Nothing to change.
+      trk.differ = 0;
+    } else if (alt.score > score + 0.4 || around || (alt.sides >= 2 && sides < 2) || (trk.differ >= 6 && P.d > 0.05 && alt.score >= 1.5)) {
+      // Switch when the finder's outline sits clearly better on paper edges, or the finder has kept saying
+      // the page is well away from the outline and there are edges there (another sheet, say).
+      ({ q, sides, ok, score } = alt.sides >= 2 ? alt : { q: P.q, ...NONE });
+      jumped = true;
+      trk.src = P.src; trk.differ = 0; trk.boost = 2; trk.sideOk = [0, 0, 0, 0];
+      if (P.src === "ai") trk.agreeAt = performance.now();
+    }
+  }
   for (let i = 0; i < 4; i++) trk.sideOk[i] = ok[i] ? trk.sideOk[i] + 1 : 0;
-  if (sides >= 2) {
+  if (jumped) {
+    trk.q = q; trk.v = ZERO(); trk.jumped = true; trk.weak = sides >= 2 ? 0 : 1; trk.strong = 0; trk.follow = null; trk.settled = false;
+  } else if (sides >= 2) {
     trk.v = q.map((p, i) => [0.5 * (p[0] - trk.q[i][0]) / gap + 0.5 * v[i][0], 0.5 * (p[1] - trk.q[i][1]) / gap + 0.5 * v[i][1]]);
-    trk.q = q; trk.weak = 0;
+    trk.q = q; trk.weak = 0; trk.follow = null; trk.moOk += gap;
     trk.strong = sides >= 3 ? trk.strong + 1 : 0;
+    if (trk.strong >= 3) trk.settled = true;
   } else {
+    // No edges to snap to. The outline moves as the print on the page moved (or, when that can't be told, as it
+    // has been moving), and when the AI has given its outline, glides slowly to that (moved on with the page
+    // too): the AI's answers scatter a little from look to look, so the outline doesn't jump to each.
     trk.weak++; trk.strong = 0;
-    trk.q = pred;
-    trk.v = v.map((d) => [d[0] * 0.5, d[1] * 0.5]);
+    const F = trk.follow;
+    let dx = 0, dy = 0;
+    for (let i = 0; i < 4; i++) { dx += (pred[i][0] - trk.q[i][0]) / 4; dy += (pred[i][1] - trk.q[i][1]) / 4; }
+    const M = gap <= 3 ? pageMotion(trk.q, dx, dy) : null;
+    trk.moOk = M ? trk.moOk + gap : 0;
+    const to = M ? moveBy(M, trk.q) : pred;
+    // (the AI's outlines move on with the page too)
+    const shift = (Q) => (M ? moveBy(M, Q) : Q.map((p, i) => [p[0] + pred[i][0] - trk.q[i][0], p[1] + pred[i][1] - trk.q[i][1]]));
+    if (F && F.q) F.q = shift(F.q);
+    trk.v = M ? to.map((p, i) => [(p[0] - trk.q[i][0]) / gap, (p[1] - trk.q[i][1]) / gap]) : v.map((d) => [d[0] * (F ? 0.8 : 0.5), d[1] * (F ? 0.8 : 0.5)]);
+    if (F && F.q) {
+      // (a little faster while it's still a fair way off)
+      const a = 1 - Math.pow(maxApart(F.q, to) > 0.012 * Math.hypot(gw, gh) ? 0.5 : M ? 0.85 : 0.75, gap);
+      trk.q = to.map((p, i) => [p[0] + a * (F.q[i][0] - p[0]), p[1] + a * (F.q[i][1] - p[1])]);
+    } else trk.q = to;
   }
   // A page that has mostly left the view isn't worth outlining.
   if (insideShare(trk.q) < 0.5) { trk.reset(); trk.hist.set(f, null); prune(f); return null; }
@@ -546,25 +647,172 @@ function prune(f) {
   for (const k of trk.cfOf.keys()) if (k < f - 40) trk.cfOf.delete(k);
 }
 
-// Share of the quad's area inside the frame (the quad clipped to the frame, Sutherland-Hodgman).
-function insideShare(q) {
+// Share of quad q's area inside the convex polygon c (q clipped to c, Sutherland-Hodgman).
+function clipShare(q, c) {
   let poly = q.map((p) => p.slice());
-  const edges = [[0, 1, 0], [0, -1, gw], [1, 1, 0], [1, -1, gh]];   // [axis, sign, offset]: sign * p[axis] + offset >= 0
-  for (const [ax, sg, off] of edges) {
+  // orientation of c, so "inside" is the same side of every edge
+  let o = 0;
+  for (let i = 0; i < c.length; i++) { const a = c[i], b = c[(i + 1) % c.length]; o += a[0] * b[1] - b[0] * a[1]; }
+  const sg = o >= 0 ? 1 : -1;
+  for (let e = 0; e < c.length && poly.length; e++) {
+    const a = c[e], b = c[(e + 1) % c.length];
+    const side = (p) => sg * ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]));
     const out = [];
     for (let i = 0; i < poly.length; i++) {
-      const a = poly[i], b = poly[(i + 1) % poly.length];
-      const da = sg * a[ax] + off, db = sg * b[ax] + off;
-      if (da >= 0) out.push(a);
-      if ((da >= 0) !== (db >= 0)) { const t = da / (da - db); out.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]); }
+      const p = poly[i], r = poly[(i + 1) % poly.length], dp = side(p), dr = side(r);
+      if (dp >= 0) out.push(p);
+      if ((dp >= 0) !== (dr >= 0)) { const t = dp / (dp - dr); out.push([p[0] + t * (r[0] - p[0]), p[1] + t * (r[1] - p[1])]); }
     }
     poly = out;
-    if (!poly.length) return 0;
   }
+  if (poly.length < 3) return 0;
   let s = 0;
   for (let i = 0; i < poly.length; i++) { const a = poly[i], b = poly[(i + 1) % poly.length]; s += a[0] * b[1] - b[0] * a[1]; }
   const full = area(q);
   return full > 0 ? Math.abs(s) / 2 / full : 0;
+}
+// Share of the quad's area inside the frame.
+const insideShare = (q) => clipShare(q, [[0, 0], [gw, 0], [gw, gh], [0, gh]]);
+
+/* ---------- How the picture moves from frame to frame ----------
+   Small patches of print inside the outline are looked for again in the next frame, and a map fitted to where
+   they went (a shift, a turn, a zoom, a slight tilt) says how the page moved in the picture. That keeps the
+   outline on the page when there are no paper edges to snap to (white paper on a white desk). Patches are
+   found at half size first, then to a fraction of a pixel at full size. */
+const MP = 8, MH = 4, MS = 3;   // patch half-size (grey px), the same at half size, search reach at half size (a
+// bigger reach lets a patch of print in lines match a line further on)
+const mo = { prev: null, half: null, halfPrev: null, hw: 0, hh: 0 };
+function halve(src, dst) {
+  const hw = mo.hw, hh = mo.hh;
+  for (let y = 0; y < hh; y++) {
+    const r0 = 2 * y * gw, r1 = r0 + gw, o = y * hw;
+    for (let x = 0; x < hw; x++) { const c = r0 + 2 * x, d = r1 + 2 * x; dst[o + x] = 0.25 * (src[c] + src[c + 1] + src[d] + src[d + 1]); }
+  }
+}
+function sad(A, B, w, ax, ay, bx, by, n) {
+  let s = 0;
+  for (let y = 0; y < n; y++) {
+    let ia = (ay + y) * w + ax, ib = (by + y) * w + bx;
+    for (let x = 0; x < n; x++) { const d = A[ia++] - B[ib++]; s += d < 0 ? -d : d; }
+  }
+  return s;
+}
+function ssd(A, B, w, ax, ay, bx, by, n) {
+  let s = 0;
+  for (let y = 0; y < n; y++) {
+    let ia = (ay + y) * w + ax, ib = (by + y) * w + bx;
+    for (let x = 0; x < n; x++) { const d = A[ia++] - B[ib++]; s += d * d; }
+  }
+  return s;
+}
+const fineV = new Float64Array(25), coarseV = new Float64Array((2 * MS + 1) * (2 * MS + 1));
+// Where the patch around (px, py) in the previous frame went, expected near (px + dx, py + dy). [x, y] or null.
+function findPatch(px, py, dx, dy) {
+  const n = 2 * MH, hw = mo.hw, hh = mo.hh, H0 = mo.halfPrev, H1 = mo.half;
+  const hx = Math.round(px / 2) - MH, hy = Math.round(py / 2) - MH;
+  if (hx < 1 || hy < 1 || hx + n >= hw || hy + n >= hh) return null;
+  // enough contrast to be found again (print, not blank paper)
+  let gsum = 0;
+  for (let y = 0; y < n; y++) {
+    const o = (hy + y) * hw + hx;
+    for (let x = 0; x < n; x++) { const a = H0[o + x]; gsum += Math.abs(H0[o + x + 1] - a) + Math.abs(H0[o + x + hw] - a); }
+  }
+  if (gsum < 3 * n * n) return null;
+  const cx = Math.round((px + dx) / 2) - MH, cy = Math.round((py + dy) / 2) - MH;
+  let best = Infinity, bx = 0, by = 0, k = 0;
+  for (let sy = -MS; sy <= MS; sy++) {
+    const yy = cy + sy;
+    for (let sx = -MS; sx <= MS; sx++, k++) {
+      const xx = cx + sx;
+      const v = yy < 0 || yy + n > hh || xx < 0 || xx + n > hw ? Infinity : sad(H0, H1, hw, hx, hy, xx, yy, n);
+      coarseV[k] = v;
+      if (v < best) { best = v; bx = xx; by = yy; }
+    }
+  }
+  if (best === Infinity || Math.abs(bx - cx) === MS || Math.abs(by - cy) === MS) return null;   // (at the edge of the reach)
+  // full size: the best of 5 x 5 positions around it, then a parabola each way for the fraction
+  const N = 2 * MP, fx = Math.round(px) - MP, fy = Math.round(py) - MP;
+  const ox = fx + 2 * (bx - hx), oy = fy + 2 * (by - hy);
+  if (fx < 0 || fy < 0 || fx + N > gw || fy + N > gh || ox - 2 < 0 || oy - 2 < 0 || ox + 2 + N > gw || oy + 2 + N > gh) return null;
+  let bi = 12, bv = Infinity;
+  for (let j = 0; j < 25; j++) {
+    const v = ssd(mo.prev, grey, gw, fx, fy, ox + (j % 5) - 2, oy + ((j / 5) | 0) - 2, N);
+    fineV[j] = v;
+    if (v < bv) { bv = v; bi = j; }
+  }
+  const ix = bi % 5, iy = (bi / 5) | 0;
+  if (ix === 0 || ix === 4 || iy === 0 || iy === 4) return null;
+  const sub = (a, b, c) => { const den = a - 2 * b + c; return den > 0 ? Math.max(-0.5, Math.min(0.5, (0.5 * (a - c)) / den)) : 0; };
+  const sx = sub(fineV[bi - 1], bv, fineV[bi + 1]), sy = sub(fineV[bi - 5], bv, fineV[bi + 5]);
+  return [ox + ix - 2 + sx + MP, oy + iy - 2 + sy + MP];
+}
+// The page's motion from the previous frame to this one, as an affine map (x' = a x + b y + c, y' = d x + e y + f;
+// near enough for one frame's worth of a moving phone), from patches inside quad Q (previous frame), expected
+// to have moved by about (dx, dy). Null when it can't be told.
+function pageMotion(Q, dx, dy) {
+  if (!mo.prev || !mo.halfPrev) return null;
+  const P = [];
+  for (let j = 0; j < 4; j++) {
+    for (let i = 0; i < 4; i++) {
+      const u = 0.2 + 0.2 * i, v = 0.2 + 0.2 * j;
+      // a point of the quad, bilinearly
+      const x = (1 - v) * ((1 - u) * Q[0][0] + u * Q[1][0]) + v * ((1 - u) * Q[3][0] + u * Q[2][0]);
+      const y = (1 - v) * ((1 - u) * Q[0][1] + u * Q[1][1]) + v * ((1 - u) * Q[3][1] + u * Q[2][1]);
+      const m = findPatch(x, y, dx, dy);
+      if (m) P.push([x, y, m[0], m[1]]);
+    }
+  }
+  if (P.length < 6) return null;
+  // start from the typical shift (most patches agree on it; a patch matched to the wrong word doesn't)
+  const med = (a) => { const s2 = a.slice().sort((x, y) => x - y); return s2[s2.length >> 1]; };
+  const tx = med(P.map((p) => p[2] - p[0])), ty = med(P.map((p) => p[3] - p[1]));
+  let use = P.filter((p) => Math.hypot(p[2] - p[0] - tx, p[3] - p[1] - ty) < 3);
+  let M = null;
+  for (let it = 0; it < 3; it++) {
+    if (use.length < 6) return null;
+    M = fitAffine(use);
+    if (!M) return null;
+    const res = P.map((p) => Math.hypot(M.a * p[0] + M.b * p[1] + M.c - p[2], M.d * p[0] + M.e * p[1] + M.f - p[3]));
+    const keep = P.filter((_, k) => res[k] < 0.8);
+    if (keep.length === use.length && keep.every((p, k) => p === use[k])) break;
+    use = keep;
+  }
+  // most of the patches must agree, and a hand-held phone doesn't turn, zoom or tilt much from frame to frame
+  if (use.length < 6 || use.length < 0.5 * P.length) return null;
+  if (Math.abs(M.a - 1) > 0.06 || Math.abs(M.e - 1) > 0.06 || Math.abs(M.b) > 0.06 || Math.abs(M.d) > 0.06) return null;
+  M.n = use.length;
+  return M;
+}
+// Least-squares affine map through point pairs [x, y, x', y'] (centred, for a well-conditioned solve).
+function fitAffine(P) {
+  let mx = 0, my = 0, nx = 0, ny = 0;
+  for (const p of P) { mx += p[0]; my += p[1]; nx += p[2]; ny += p[3]; }
+  const n = P.length;
+  mx /= n; my /= n; nx /= n; ny /= n;
+  let sxx = 0, sxy = 0, syy = 0, sxX = 0, syX = 0, sxY = 0, syY = 0;
+  for (const p of P) {
+    const x = p[0] - mx, y = p[1] - my, X = p[2] - nx, Y = p[3] - ny;
+    sxx += x * x; sxy += x * y; syy += y * y; sxX += x * X; syX += y * X; sxY += x * Y; syY += y * Y;
+  }
+  const det = sxx * syy - sxy * sxy;
+  if (det < 1e-6 * (sxx + syy) * (sxx + syy) || sxx + syy < 1) return null;   // points all in a line
+  const a = (sxX * syy - syX * sxy) / det, b = (syX * sxx - sxX * sxy) / det;
+  const d = (sxY * syy - syY * sxy) / det, e = (syY * sxx - sxY * sxy) / det;
+  return { a, b, c: nx - a * mx - b * my, d, e, f: ny - d * mx - e * my };
+}
+const moveBy = (M, q) => q.map(([x, y]) => [M.a * x + M.b * y + M.c, M.d * x + M.e * y + M.f]);
+// After a frame: it becomes the previous frame (the buffers swap, so the next frame is drawn into the old one).
+function keepFrame() {
+  if (!grey) return;
+  if (!mo.prev || mo.prev.length !== grey.length) mo.prev = new Float32Array(grey.length);
+  const t = mo.prev; mo.prev = grey; grey = t;
+  const h = mo.halfPrev; mo.halfPrev = mo.half; mo.half = h;
+}
+function halfNow() {
+  const hw = gw >> 1, hh = gh >> 1;
+  if (mo.hw !== hw || mo.hh !== hh) { mo.hw = hw; mo.hh = hh; mo.half = null; mo.halfPrev = null; }
+  if (!mo.half) mo.half = new Float32Array(hw * hh);
+  halve(grey, mo.half);
 }
 
 /* ---------- AI requests ---------- */
@@ -594,31 +842,129 @@ function onAIResult(e) {
   onFinder(ai.frame, q, "ai");
 }
 
+/* ---------- The camera view ----------
+   When the page hands over its preview canvas, this worker draws each camera frame there itself, with the
+   outline found in that same frame on top. The outline then sits exactly on the page as shown, instead of
+   trailing the live video by a frame or two (which made it look shaky in a hand-held phone). */
+const view = { ctx: null, w: 0, h: 0, dpr: 1, steady: false };
+const LOOK = { bg: "#050807", line: "#8DBCEB", fill: "rgba(141, 188, 235, .16)", okLine: "#76C898", okFill: "rgba(118, 200, 152, .2)" };
+// pic: the frame (a VideoFrame, or a still of it taken by the page). Returns whether it was drawn.
+function drawView(pic, quad) {
+  const c = view.ctx;
+  if (!c || !view.w || !view.h) return false;
+  const fw = pic.displayWidth || pic.width, fh = pic.displayHeight || pic.height;
+  if (!fw || !fh) return false;
+  // the whole frame, letterboxed like the video element did (object-fit: contain)
+  const k = Math.min(view.w / fw, view.h / fh), dw = fw * k, dh = fh * k, ox = (view.w - dw) / 2, oy = (view.h - dh) / 2;
+  if (dw < view.w - 0.5 || dh < view.h - 0.5) { c.fillStyle = LOOK.bg; c.fillRect(0, 0, view.w, view.h); }
+  c.drawImage(pic, ox, oy, dw, dh);
+  if (!quad) return true;
+  c.beginPath();
+  for (let i = 0; i < 4; i++) { const X = ox + quad[i][0] * dw, Y = oy + quad[i][1] * dh; if (i) c.lineTo(X, Y); else c.moveTo(X, Y); }
+  c.closePath();
+  c.fillStyle = view.steady ? LOOK.okFill : LOOK.fill;
+  c.fill();
+  c.lineWidth = 3 * view.dpr; c.lineJoin = "round";
+  c.strokeStyle = view.steady ? LOOK.okLine : LOOK.line;
+  c.stroke();
+  return true;
+}
+function clearView() {
+  if (!view.ctx || !view.w) return;
+  view.ctx.fillStyle = LOOK.bg; view.ctx.fillRect(0, 0, view.w, view.h);
+}
+
+/* ---------- Reading frames ----------
+   A VideoFrame is read either by copying its pixels (exact, and quick when the frame is in main memory) or by
+   drawing it small and reading the small picture back (the phone's graphics chip does the shrinking where it
+   can, so a frame held there needn't come off it whole). The check at the start finds out which ways give the
+   picture shown on screen; when both do, the first frames are timed both ways, and copying is kept unless
+   drawing is clearly quicker.
+   Stills taken by the page are drawn. */
+const rd = { copy: true, draw: false, pick: "", t: { copy: [], draw: [] } };   // (until the check: copies)
+const drawer = { c: [null, null], pick: -1, t: [[], []] };   // canvases: on the graphics chip, in main memory
+const median = (a) => { const s = a.slice().sort((x, y) => x - y); return s[s.length >> 1]; };
+
+async function fromCopy(vf, wantAI) {
+  if (vf.rotation || vf.flip || !FORMATS.has(vf.format)) throw new Error("This frame can't be copied as shown");
+  const size = vf.allocationSize();
+  if (!planes || planes.length < size) planes = new Uint8Array(size);
+  const layout = await vf.copyTo(planes);
+  return fromPlanes(planes, layout, vf.format, vf.visibleRect.width, vf.visibleRect.height, vf.colorSpace, wantAI);
+}
+
+function fromDrawn(pic, wantAI) {
+  const fw = pic.displayWidth || pic.width, fh = pic.displayHeight || pic.height;
+  if (!fw || !fh) throw new Error("Empty picture");
+  sizeGrey(fw, fh);
+  // (drawn at twice the grey picture's size when the frame is that big, then averaged down: a picture shrunk a
+  // long way in one go has ragged edges that would make the outline flicker)
+  const k = Math.max(fw, fh) >= 2 * GL ? 2 : 1, w = gw * k, h = gh * k;
+  const i = drawer.pick >= 0 ? drawer.pick : drawer.t[0].length <= drawer.t[1].length ? 0 : 1;
+  let ctx = drawer.c[i];
+  if (!ctx || ctx.canvas.width !== w || ctx.canvas.height !== h) {
+    ctx = drawer.c[i] = new OffscreenCanvas(w, h).getContext("2d", { alpha: false, willReadFrequently: i === 1 });
+  }
+  const t0 = performance.now();
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "medium";
+  ctx.drawImage(pic, 0, 0, w, h);
+  const px = ctx.getImageData(0, 0, w, h).data;
+  if (drawer.pick < 0) {
+    drawer.t[i].push(performance.now() - t0);
+    if (drawer.t[0].length >= 8 && drawer.t[1].length >= 8) drawer.pick = median(drawer.t[0].slice(2)) <= median(drawer.t[1].slice(2)) ? 0 : 1;
+  }
+  return fromRGBA(px, w, h, wantAI, k);
+}
+
+async function readFrame(vf, wantAI) {
+  // (with both ways usable: drawn first, until the drawing canvas is chosen, then each in turn, then the quicker)
+  let how = rd.pick || (rd.copy && rd.draw ? (drawer.pick < 0 ? "draw" : rd.t.copy.length <= rd.t.draw.length ? "copy" : "draw") : rd.copy ? "copy" : "draw");
+  const t0 = performance.now();
+  let px;
+  if (how === "copy") {
+    try { px = await fromCopy(vf, wantAI); }
+    catch (err) {
+      rd.copy = false; rd.pick = "";
+      if (!rd.draw) throw err;
+      how = "draw";
+    }
+  }
+  if (how === "draw") px = fromDrawn(vf, wantAI);
+  if (!rd.pick) {
+    if (rd.copy && rd.draw) {
+      if (how === "copy" || drawer.pick >= 0) rd.t[how].push(performance.now() - t0);
+      // (copies are the more exact way: drawing is kept only when it's clearly quicker)
+      if (rd.t.copy.length >= 10 && rd.t.draw.length >= 10) {
+        const c = median(rd.t.copy.slice(2)), d = median(rd.t.draw.slice(2));
+        rd.pick = c > 10 && d < 0.67 * c ? "draw" : "copy";
+      }
+    } else rd.pick = how;
+  }
+  st.way = how === "copy" ? "copy" : drawer.pick === 1 ? "draw cpu" : "draw";
+  return px;
+}
+
 /* ---------- Frames from the page ---------- */
-const st = { ms: 0, hz: 0, n: 0, since: 0, pad: 0, trace: false, events: [] };
+const st = { ms: 0, hz: 0, n: 0, since: 0, pad: 0, trace: false, events: [], way: "" };
 
 async function onFrameMsg(m) {
   const t0 = performance.now();
   const f = m.seq;
   const wantsAI = wantAI(t0);
+  const vf = m.frame || null, still = m.still || null, ts = vf ? vf.timestamp : undefined;
+  const close = () => {
+    if (vf) { try { vf.close(); } catch (_) { /* closed */ } }
+    if (still) { try { still.close(); } catch (_) { /* closed */ } }
+  };
   let px = null;
   try {
-    if (m.frame) {
-      const vf = m.frame;
-      try {
-        if (vf.rotation || vf.flip) throw new Error("rotated frame");
-        const size = vf.allocationSize();
-        if (!planes || planes.length < size) planes = new Uint8Array(size);
-        const layout = await vf.copyTo(planes);
-        px = fromPlanes(planes, layout, vf.format, vf.visibleRect.width, vf.visibleRect.height, vf.colorSpace, wantsAI);
-      } finally {
-        vf.close();
-      }
-    } else {
-      px = fromRGBA(new Uint8ClampedArray(m.rgba), m.w, m.h, wantsAI);
-    }
+    if (vf) px = await readFrame(vf, wantsAI);
+    else if (still) { px = fromDrawn(still, wantsAI); st.way = drawer.pick === 1 ? "still cpu" : "still"; }
+    else { px = fromRGBA(new Uint8ClampedArray(m.rgba), m.w, m.h, wantsAI); st.way = ""; }
   } catch (err) {
-    self.postMessage({ type: "quad", seq: f, epoch: m.epoch, quad: null, error: String((err && err.message) || err), fallback: !!m.frame });
+    close();
+    self.postMessage({ type: "quad", seq: f, epoch: m.epoch, quad: null, error: String((err && err.message) || err), fallback: !!(vf || still) });
     return;
   }
   let res = null;
@@ -627,9 +973,14 @@ async function onFrameMsg(m) {
     res = track(f, m.cf === undefined ? f : m.cf);
   } catch (err) {
     trk.reset();
+    close();
     self.postMessage({ type: "quad", seq: f, epoch: m.epoch, quad: null, error: String((err && err.message) || err) });
     return;
   }
+  let drawn = false;
+  const pic = vf || still;
+  if (pic && view.ctx) { try { drawn = drawView(pic, res ? res.quad : null); } catch (_) { /* drawing isn't essential */ } }
+  close();
   if (st.pad) { const end = t0 + st.pad; while (performance.now() < end) { /* test hook: a slower phone */ } }
   const ms = performance.now() - t0;
   st.ms = st.ms ? st.ms * 0.9 + ms * 0.1 : ms;
@@ -637,43 +988,43 @@ async function onFrameMsg(m) {
   if (!st.since) st.since = t0;
   if (t0 - st.since >= 1000) { const hz = (st.n * 1000) / (t0 - st.since); st.hz = st.hz ? st.hz * 0.7 + hz * 0.3 : hz; st.n = 0; st.since = t0; }
   self.postMessage({
-    type: "quad", seq: f, epoch: m.epoch, quad: res ? res.quad : null, sides: res ? res.sides : 0, src: res ? trk.src : "", jump: !!trk.jumped,
-    sig: signature(), stats: { liveMs: st.ms, liveHz: st.hz, aiMs: ai.ms, aiHz: ai.hz },
-    trace: st.trace ? { ok: trk.sideOk.join(","), ev: st.events.splice(0) } : undefined,
+    type: "quad", seq: f, epoch: m.epoch, quad: res ? res.quad : null, sides: res ? res.sides : 0, src: res ? trk.src : "", jump: !!trk.jumped, drawn,
+    sig: signature(), stats: { liveMs: st.ms, liveHz: st.hz, aiMs: ai.ms, aiHz: ai.hz, way: st.way },
+    trace: st.trace ? { ok: trk.sideOk.join(","), ev: st.events.splice(0), ts, wt: performance.now() } : undefined,
   });
   trk.jumped = false;
+  keepFrame();
 }
 
-// Checks that VideoFrame copies show the same picture as the video on screen (same way up, same framing).
+// Which ways of reading VideoFrames give the same picture as the video on screen (same way up, same framing)?
+// Each is compared with a copy of the same frame drawn by the page.
+function corrWith(ref) {
+  const a = grey, n = a.length;
+  if (!ref || ref.length !== n) return 0;
+  let sa = 0, sb = 0;
+  for (let i = 0; i < n; i++) { sa += a[i]; sb += ref[i]; }
+  sa /= n; sb /= n;
+  let num = 0, da = 0, db = 0;
+  for (let i = 0; i < n; i++) { const x = a[i] - sa, y = ref[i] - sb; num += x * y; da += x * x; db += y * y; }
+  return da > 1 && db > 1 ? num / Math.sqrt(da * db) : (Math.abs(sa - sb) < 8 ? 1 : 0);
+}
 async function onCheck(m) {
   const vf = m.frame;
-  let ok = false, corr = 0, ms = 0;
   const format = vf.format || "";
+  let corrCopy = -1, corrDraw = -1, msCopy = 0, msDraw = 0;
   try {
-    if (!vf.rotation && !vf.flip && FORMATS.has(format)) {
-      const t0 = performance.now();
-      const size = vf.allocationSize();
-      if (!planes || planes.length < size) planes = new Uint8Array(size);
-      const layout = await vf.copyTo(planes);
-      fromPlanes(planes, layout, format, vf.visibleRect.width, vf.visibleRect.height, vf.colorSpace, false);
-      ms = performance.now() - t0;
-      const a = grey.slice();
-      fromRGBA(new Uint8ClampedArray(m.rgba), m.w, m.h, false);
-      const b = grey, n = a.length;
-      let sa = 0, sb = 0;
-      for (let i = 0; i < n; i++) { sa += a[i]; sb += b[i]; }
-      sa /= n; sb /= n;
-      let num = 0, da = 0, db = 0;
-      for (let i = 0; i < n; i++) { const x = a[i] - sa, y = b[i] - sb; num += x * y; da += x * x; db += y * y; }
-      corr = da > 1 && db > 1 ? num / Math.sqrt(da * db) : (Math.abs(sa - sb) < 8 ? 1 : 0);
-      ok = corr > 0.85;
-    }
+    fromRGBA(new Uint8ClampedArray(m.rgba), m.w, m.h, false);
+    const ref = grey.slice();
+    try { const t0 = performance.now(); await fromCopy(vf, false); msCopy = performance.now() - t0; corrCopy = corrWith(ref); } catch (_) { /* can't be copied */ }
+    try { const t0 = performance.now(); fromDrawn(vf, false); msDraw = performance.now() - t0; corrDraw = corrWith(ref); } catch (_) { /* can't be drawn */ }
   } catch (_) {
-    ok = false;
+    /* no picture to compare with */
   } finally {
     try { vf.close(); } catch (_) { /* already closed */ }
   }
-  self.postMessage({ type: "check", epoch: m.epoch, ok, corr, ms, format });
+  rd.copy = corrCopy > 0.85; rd.draw = corrDraw > 0.85; rd.pick = ""; rd.t = { copy: [], draw: [] };
+  if (st.forceRead) { rd.copy = rd.copy && st.forceRead === "copy"; rd.draw = rd.draw && st.forceRead === "draw"; }   // tests
+  self.postMessage({ type: "check", epoch: m.epoch, ok: rd.copy || rd.draw, copy: rd.copy, draw: rd.draw, corrCopy, corrDraw, msCopy, msDraw, format });
 }
 
 self.onmessage = (e) => {
@@ -683,7 +1034,13 @@ self.onmessage = (e) => {
   else if (m.type === "port") { ai.port = m.port; ai.port.onmessage = onAIResult; ai.busy = false; }
   else if (m.type === "ai-off") { ai.port = null; ai.busy = false; }
   else if (m.type === "cv") onFinder(m.seq, m.quad, "cv");
-  else if (m.type === "reset") { trk.reset(); trk.cfOf.clear(); ai.busy = false; ai.seq++; ai.prev = null; }
+  else if (m.type === "reset") { trk.reset(); trk.cfOf.clear(); ai.busy = false; ai.seq++; ai.prev = null; mo.prev = null; mo.halfPrev = null; clearView(); }
+  else if (m.type === "view") { view.ctx = m.canvas.getContext("2d", { alpha: false }); view.dpr = m.dpr || 1; }
+  else if (m.type === "view-size") {
+    if (view.ctx) { view.ctx.canvas.width = view.w = m.w; view.ctx.canvas.height = view.h = m.h; view.dpr = m.dpr || view.dpr; clearView(); }
+  }
+  else if (m.type === "view-off") { clearView(); view.w = view.h = 0; }
+  else if (m.type === "look") view.steady = !!m.steady;
   else if (m.type === "ease") ai.ease = !!m.on;
-  else if (m.type === "debug") { st.pad = m.liveMs || 0; st.trace = !!m.trace; }
+  else if (m.type === "debug") { st.pad = m.liveMs || 0; st.trace = !!m.trace; st.forceRead = m.read || ""; }
 };
