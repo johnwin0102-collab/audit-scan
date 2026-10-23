@@ -20,6 +20,7 @@ const FLAT = {
   STOP: 2.0,         // px at LA: a later pass that moves less than this isn't worth applying
   SUB: 40,           // points per structure used in the fit (more adds time, not accuracy)
   LAMBDA: 0.5,       // smoothness of the correction
+  SOFT_W: 1.0,         // weight of the light hold on sides whose paper edge wasn't found (found edges: 4)
   MIN_NONAFFINE: 2.5,  // px at LA: bending below this, and...
   MIN_MOVE: 6,         // ...overall correction below this, counts as a flat page
   MAX_MOVE: 120,       // px at LA: anything bigger is a misreading, so the page is left as cropped
@@ -502,10 +503,25 @@ function subsample(p, k) {
   return Object.assign({}, p, { x: xs, y: ys });
 }
 
-function fitField(spl, structs, edges, other, axis, lam = FLAT.LAMBDA, iters = 3) {
+// Typical slope of the structures (dy/dx across, dx/dy down): the page's own skew, which flattening
+// keeps. A curl only bends part of a page, so the median follows the flat majority.
+function medianSlope(list, horizontal, minSpan = 100) {
+  const sl = [];
+  for (const p of list) {
+    const a = horizontal ? p.x : p.y, b = horizontal ? p.y : p.x;
+    let lo = Infinity, hi = -Infinity;
+    for (const v of a) { if (v < lo) lo = v; if (v > hi) hi = v; }
+    if (hi - lo < minSpan) continue;
+    const f = polyfit(a, b, 1);
+    sl.push(f.c[1] / f.span);
+  }
+  return sl.length ? median(sl) : 0;
+}
+
+function fitField(spl, structs, edges, other, axis, lam = FLAT.LAMBDA, iters = 3, slopeFixed = null) {
   const n = spl.n, nb = n + 1;                       // spline coefficients + shared slope
   const groups = structs.map((p) => ({ p: subsample(p, FLAT.SUB), tgt: null, w0: 1 }))
-    .concat(edges.map((e) => ({ p: subsample(e, FLAT.SUB), tgt: e.target, w0: 4 })));
+    .concat(edges.map((e) => ({ p: subsample(e, FLAT.SUB), tgt: e.target, w0: e.w0 || 4 })));
   if (!groups.length) return { coef: new Float64Array(n), slope: 0 };
   const ctr = axis === 1 ? spl.W / 2 : spl.H / 2;
   const P = spl.penalty();
@@ -565,6 +581,7 @@ function fitField(spl, structs, edges, other, axis, lam = FLAT.LAMBDA, iters = 3
       A[i * nb + i] += 1e-3;
     }
     A[n * nb + n] += 1e-6;
+    if (slopeFixed !== null) { A[n * nb + n] += 1e9; bv[n] += 1e9 * slopeFixed; }
     // eliminate each structure's own row/column position (Schur complement)
     for (const s of schur) {
       const ids = s.ids, vals = s.vals, k = ids.length;
@@ -622,8 +639,27 @@ function fitPass(gray, m, Wa, Ha) {
   const hor = st.rules.concat(st.texts);
   const horE = ["top", "bottom"].filter((k) => edges[k]).map((k) => edges[k]);
   const verE = ["left", "right"].filter((k) => edges[k]).map((k) => edges[k]);
-  const cvv = fitField(spl, hor, horE, null, 1).coef;
-  const cu = fitField(spl, st.vlines, verE, cvv, 0).coef;
+  // Sides whose paper edge wasn't found stay where the corners put them, unless the content insists
+  // (a light hold), so flattening can't push the page out of the frame.
+  const hold = (horizontal, pos) => {
+    const xs = new Float64Array(19), ys = new Float64Array(19);
+    for (let i = 0; i < 19; i++) {
+      const t = 0.05 + (0.9 * i) / 18;
+      if (horizontal) { xs[i] = m + t * Wa; ys[i] = pos; } else { xs[i] = pos; ys[i] = m + t * Ha; }
+    }
+    return { x: xs, y: ys, target: pos, w0: FLAT.SOFT_W };
+  };
+  const softH = [], softV = [];
+  if (!edges.top) softH.push(hold(true, m - delta[1]));
+  if (!edges.bottom) softH.push(hold(true, m + Ha + delta[1]));
+  if (!edges.left) softV.push(hold(false, m - delta[0]));
+  if (!edges.right) softV.push(hold(false, m + Wa + delta[0]));
+  // The page's own skew: with paper edges to go by, the fit finds it; without them, the median slope
+  // of the content stands in.
+  const sv0 = horE.length ? null : medianSlope(hor, true) * spl.W;
+  const su0 = verE.length ? null : medianSlope(st.vlines, false) * spl.W;
+  const cvv = fitField(spl, hor, horE.concat(softH), null, 1, FLAT.LAMBDA, 3, sv0).coef;
+  const cu = fitField(spl, st.vlines, verE.concat(softV), cvv, 0, FLAT.LAMBDA, 3, su0).coef;
   // how far the correction would move things inside the page, and how much of it is bending
   const pts = [];
   for (let y = m; y < m + Ha; y += 20) for (let x = m; x < m + Wa; x += 20) pts.push([x, y, spl.eval(cu, x, y), spl.eval(cvv, x, y)]);
