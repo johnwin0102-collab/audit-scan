@@ -4,7 +4,7 @@
 "use strict";
 
 (() => {
-  const VERSION = "1.3.1";
+  const VERSION = "1.3.2";
 
   const AREAS = [
     { value: "Mixed", label: "Mixed (Claude sorts)", short: "" },
@@ -375,6 +375,7 @@
     stats.rtMs = ema(stats.rtMs, performance.now() - tracker.sentAt);
     tracker.src = m.src || "";
     cam.sides = m.sides || 0;
+    cam.cut = !!m.cut;
     if (m.trace && tracker.trace) tracker.trace.push({ seq: m.seq, cf: tracker.sentFrame, t: performance.now(), q: m.quad, ...m.trace });
     // How fast the outline moves (per camera frame), to place it on frames shown before its next update.
     const f = tracker.sentFrame, q = m.quad, p = cam.motion;
@@ -745,6 +746,7 @@
     // worker last drew a frame, frames drawn since rate.at, answers in a row that kept up with the camera
     synced: false, viewing: false, viewW: 0, viewH: 0, syncAt: 0, drawnAt: 0, drawN: 0, rate: { at: 0, frame: 0, slow: 0 }, okRun: 0, lastAnswer: 0,
     fps: 0,   // frames a second the camera is set to give
+    cut: false,   // the outline isn't shown because part of the page is out of view
   };
   // Live page finding: every new camera frame goes to the live outline worker (or, if that worker isn't
   // running, the AI finder looks at every frame it can keep up with); the classical edge finder runs
@@ -779,10 +781,7 @@
     cam.starting = true;
     setHint("Starting camera…");
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: { facingMode: { ideal: "environment" }, width: { ideal: 3840 }, height: { ideal: 2160 }, frameRate: { ideal: 30, max: 30 } },
-      });
+      const stream = await openCamera();
       if (S.screen !== "camera" || document.hidden) { stream.getTracks().forEach((t) => t.stop()); return; }
       cam.stream = stream;
       cam.track = stream.getVideoTracks()[0];
@@ -808,6 +807,25 @@
     } finally {
       cam.starting = false;
     }
+  }
+
+  // 4:3, the shape of the camera's sensor (CamScanner uses it too): the view takes in more of the desk around the
+  // page than the 16:9 crop of it, with about as many pixels as 4K. Only as the camera gives it, not cut out of
+  // its 16:9 picture; a camera that can't give a sharp 4:3 picture at full speed keeps to 16:9 4K.
+  async function openCamera() {
+    const base = { facingMode: { ideal: "environment" }, frameRate: { ideal: 30, max: 30 } };
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { ...base, width: { ideal: 3264 }, height: { ideal: 2448 }, aspectRatio: { ideal: 4 / 3 }, resizeMode: { ideal: "none" } },
+    });
+    const track = stream.getVideoTracks()[0];
+    const s = (track && track.getSettings && track.getSettings()) || {};
+    const long = Math.max(s.width || 0, s.height || 0);
+    if (track && ((long && long < 3000) || (s.frameRate && s.frameRate < 24))) {
+      try { await track.applyConstraints({ ...base, width: { ideal: 3840 }, height: { ideal: 2160 } }); }
+      catch (_) { /* keeps the picture it has */ }
+    }
+    return stream;
   }
 
   function camFail(msg) {
@@ -854,7 +872,7 @@
 
   function resetDetection() {
     cam.lastQuad = null; cam.shown = null; cam.target = null; cam.anchor = null; cam.steadySince = 0; cam.misses = 0; cam.armed = true;
-    cam.showSteady = false; cam.lostSince = performance.now();
+    cam.showSteady = false; cam.lostSince = performance.now(); cam.cut = false;
     live.mlQuad = null; live.cvQuad = null; live.cvAt = 0;
     tracker.epoch++; tracker.busy = false; tracker.sentFrame = -1; tracker.src = "";
     cam.motion = { q: null, f: -1, v: null };
@@ -1100,7 +1118,7 @@
     setRing(progress);
     if (progress >= 1) { captureFromCamera(); return; }
     let hint;
-    if (!cam.lastQuad) hint = cam.lostSince && now - cam.lostSince > 3000 ? "No page found. Try a darker background, or tap the shutter" : "Point the camera at a page";
+    if (!cam.lastQuad) hint = cam.cut ? "Move back to fit the whole page" : cam.lostSince && now - cam.lostSince > 3000 ? "No page found. Try a darker background, or tap the shutter" : "Point the camera at a page";
     else if (!cam.armed && auto) hint = "Captured. Turn to the next page";
     else if (auto) hint = cam.steadySince ? "Hold steady…" : "Page found";
     else hint = "Page found. Tap the shutter";

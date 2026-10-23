@@ -233,7 +233,9 @@ const prof = new Float64Array(2 * (RMAX + MM) + 2);
 const cum = new Float64Array(prof.length + 1);
 const okv = new Uint8Array(prof.length);
 const resp = [new Float64Array(prof.length), new Float64Array(prof.length)];
-const OUTER = 0.6;   // an edge further out wins if it's at least this strong compared with the strongest
+const OUTER = 0.6;   // (mode "outer") an edge further out wins if it's at least this strong compared with the strongest
+let PICK = "near";   // how a side picks among the edges in reach: "near" the expected line, or the "outer"most
+let SWITCH = "edges";   // (tests) when the outline goes over to the finder's: "edges" when better on edges, "ai" when it insists
 const tk = new Float64Array(K), offs = [new Float64Array(K), new Float64Array(K)], good = [new Uint8Array(K), new Uint8Array(K)];
 const vals = [new Float64Array(K), new Float64Array(K)];
 for (let k = 0; k < K; k++) tk[k] = 0.07 + (0.86 * k) / (K - 1);
@@ -304,7 +306,11 @@ function fitLine(sign, out) {
 // One side, P0 -> P1 in grey px, page centre (cx, cy). Returns null, or { l, frac, str }: where the edge
 // found starts and ends with its direction at each end (l = [sx, sy, ex, ey, dsx, dsy, dex, dey]), the
 // share of the side it was found along, and how strong a step it is (grey levels).
-function snapSide(P0x, P0y, P1x, P1y, cx, cy, R) {
+// pick: "near" takes, at each point, the clear edge nearest the expected line (so a side stays on the edge
+// it's on, or goes to the edge it's sent to, instead of hopping to a printed box or a sheet underneath);
+// "outer" takes the outermost edge nearly as strong as the strongest.
+function snapSide(P0x, P0y, P1x, P1y, cx, cy, R, pick = PICK) {
+  const sig = Math.max(3, R / 2.5);
   const dx = P1x - P0x, dy = P1y - P0y, L = Math.hypot(dx, dy) || 1e-9;
   let nx = -dy / L, ny = dx / L;
   if (((P0x + P1x) / 2 - cx) * nx + ((P0y + P1y) / 2 - cy) * ny < 0) { nx = -nx; ny = -ny; }
@@ -337,15 +343,31 @@ function snapSide(P0x, P0y, P1x, P1y, cx, cy, R) {
       if (p > best0) { best0 = p; j0 = j; }
       if (q > best1) { best1 = q; j1 = j; }
     }
-    // The page's own edge is the outermost thing on the page: a table column or a printed rule inside it
-    // can look like an edge too, so a peak further out that is nearly as strong is taken instead.
-    for (let sign = 0; sign < 2; sign++) {
-      const r = resp[sign], best = sign === 0 ? best0 : best1;
-      if (best <= T_STEP) continue;
-      for (let j = MM + 2 * R; j > (sign === 0 ? j0 : j1); j--) {
-        if (r[j] >= OUTER * best && r[j] > T_STEP && r[j] >= r[j - 1] && (j === MM + 2 * R || r[j] >= r[j + 1])) {
-          if (sign === 0) { j0 = j; best0 = r[j]; } else { j1 = j; best1 = r[j]; }
-          break;
+    if (pick === "near") {
+      // the peak (a local maximum) that's strongest once weighed by how near the expected line it is
+      for (let sign = 0; sign < 2; sign++) {
+        const r = resp[sign], best = sign === 0 ? best0 : best1;
+        if (best <= T_STEP) continue;
+        let bw = -1, bj = -1;
+        for (let j = MM; j <= MM + 2 * R; j++) {
+          const v = r[j];
+          if (v <= T_STEP || v < 0.25 * best || (j > MM && v < r[j - 1]) || (j < MM + 2 * R && v < r[j + 1])) continue;
+          const sd = (j - R - MM) / sig, w = v / (1 + sd * sd);
+          if (w > bw) { bw = w; bj = j; }
+        }
+        if (bj >= 0) { if (sign === 0) { j0 = bj; best0 = r[bj]; } else { j1 = bj; best1 = r[bj]; } }
+      }
+    } else {
+      // The page's own edge is the outermost thing on the page: a table column or a printed rule inside it
+      // can look like an edge too, so a peak further out that is nearly as strong is taken instead.
+      for (let sign = 0; sign < 2; sign++) {
+        const r = resp[sign], best = sign === 0 ? best0 : best1;
+        if (best <= T_STEP) continue;
+        for (let j = MM + 2 * R; j > (sign === 0 ? j0 : j1); j--) {
+          if (r[j] >= OUTER * best && r[j] > T_STEP && r[j] >= r[j - 1] && (j === MM + 2 * R || r[j] >= r[j + 1])) {
+            if (sign === 0) { j0 = j; best0 = r[j]; } else { j1 = j; best1 = r[j]; }
+            break;
+          }
         }
       }
     }
@@ -417,13 +439,13 @@ function onBorder(a, b, tol = 1.5) {
 // score: how well the outline sits on paper edges (0 to 4: each side's share on an edge, weighed by how
 // clear the edge is).
 const NONE = { sides: 0, ok: [false, false, false, false], score: 0 };
-function snapQuad(Q, R) {
+function snapQuad(Q, R, pick = PICK) {
   const cx = (Q[0][0] + Q[1][0] + Q[2][0] + Q[3][0]) / 4, cy = (Q[0][1] + Q[1][1] + Q[2][1] + Q[3][1]) / 4;
   const lines = [], ok = [false, false, false, false];
   let sides = 0, score = 0;
   for (let i = 0; i < 4; i++) {
     const a = Q[i], b = Q[(i + 1) % 4];
-    const s = onBorder(a, b) ? null : snapSide(a[0], a[1], b[0], b[1], cx, cy, R);
+    const s = onBorder(a, b) ? null : snapSide(a[0], a[1], b[0], b[1], cx, cy, R, pick);
     if (s) { sides++; ok[i] = true; lines.push(s.l); score += s.frac * Math.min(1, s.str / 30); }
     else lines.push([a[0], a[1], b[0], b[1], b[0] - a[0], b[1] - a[1], b[0] - a[0], b[1] - a[1]]);
   }
@@ -446,13 +468,22 @@ const trk = {
   proposal: null,            // a finder's outline to try against the edges in the next frame
   follow: null,              // with no edges to hold on to: the AI's outline the outline glides to ({ q, far })
   moOk: 0,                   // camera frames in a row the outline has kept to the page (on edges, or with the print)
+  lastF: -1, jumpF: -1,      // the last frame followed; the frame from which the outline last jumped to a new place
   settled: false,            // the outline has been on the page (on its edges, or agreeing with the AI)
   sideOk: [0, 0, 0, 0],      // frames in a row each side has sat on an edge
   cfOf: new Map(),           // worker frame number -> camera frame number
   unsure: -1,                // last frame before which a stall happened, until the AI confirms the outline
-  reset() { this.q = null; this.v = null; this.src = ""; this.miss = 0; this.weak = 0; this.boost = 0; this.hist.clear(); this.strong = 0; this.differ = 0; this.cf = -1; this.sideOk = [0, 0, 0, 0]; this.unsure = -1; this.proposal = null; this.follow = null; this.moOk = 0; this.settled = false; },
+  aiD: 1, aiAt: 0, far: 0,   // the AI's last answer: how far its page was from the outline (share of the diagonal),
+                             // when it came, and how many answers running have put the page well away (see noteAI)
+  agrees: 0,                 // the AI's answers that have agreed with the outline since it was put where it is
+  shown: false, cut: false,  // the outline was shown on the last frame; it wasn't, as part of the page was out of view
+  reset() { this.q = null; this.v = null; this.src = ""; this.miss = 0; this.weak = 0; this.boost = 0; this.hist.clear(); this.strong = 0; this.differ = 0; this.cf = -1; this.sideOk = [0, 0, 0, 0]; this.unsure = -1; this.proposal = null; this.lastProp = null; this.follow = null; this.moOk = 0; this.settled = false; this.jumpF = -1; this.aiD = 1; this.aiAt = 0; this.far = 0; this.agrees = 0; this.shown = false; },
 };
 const ZERO = () => [[0, 0], [0, 0], [0, 0], [0, 0]];
+// How close the AI's outline must be to the tracked one to agree with it (share of the diagonal): an outline
+// with all four sides on edges is given a little more room. Further off, the AI's outline is tried against
+// the edges (see track: a proposal).
+let AGREE_FIRM = 0.025, AGREE = 0.012;
 const toPx = (q) => q.map(([x, y]) => [x * gw, y * gh]);
 const toNorm = (q) => q.map(([x, y]) => [x / gw, y / gh]);
 
@@ -474,6 +505,14 @@ function align(A, ref) {
     }
   }
   return { q: best, d: bd };
+}
+
+// What the AI's answer says of the outline (d: how far apart, share of the diagonal). "Well away" is further than
+// the AI is usually off: a little further for an outline that sits on paper edges.
+function noteAI(d, now) {
+  const edges = trk.sideOk.filter((n) => n >= 3).length >= 3;
+  trk.aiD = d; trk.aiAt = now;
+  trk.far = d > (edges ? 0.05 : 0.035) ? trk.far + 1 : 0;
 }
 
 // A finder's answer about frame f: normalised corners, or null for "no page". src: "ai" or "cv".
@@ -509,6 +548,9 @@ function onFinder(f, quad, src) {
     }
     ai.prev = { cf: cfF, q: A };
   }
+  // An answer about a frame from before the outline last jumped to a new place says nothing about where the
+  // outline is now (the jump came after it).
+  if (trk.q && f < trk.jumpF) return;
   // No edges to hold on to (white paper on a white desk, say): the outline follows the AI, moved on to now as
   // the outline has moved since (see track: with the print on the page, or gliding).
   if (src === "ai" && trk.q && trk.weak >= 2) {
@@ -517,19 +559,21 @@ function onFinder(f, quad, src) {
     let T;
     if (ref && trk.moOk >= trk.cf - cfF) { const m = align(A, ref).q; T = m.map((p, i) => [p[0] + trk.q[i][0] - ref[i][0], p[1] + trk.q[i][1] - ref[i][1]]); }
     else T = align(Ax, trk.q).q;
-    trk.src = src; trk.agreeAt = now;
+    trk.src = src;
     // An answer well away from the outline: the outline goes straight there; but once the outline has been on
     // the page (on its edges, or agreeing with the AI), only when the answer before was well away too, so one
     // odd answer doesn't throw it off. Either way, the next frame also looks for edges around the AI's outline.
     const F = trk.follow, diag = Math.hypot(gw, gh), d = maxApart(T, trk.q);
+    noteAI(d / diag, now);
     if (d > 0.025 * diag) {
       if (trk.settled && !(F && F.far)) { trk.follow = { q: F ? F.q : null, far: true }; return; }
-      trk.q = T; trk.v = ZERO(); trk.boost = 1; trk.jumped = true; trk.settled = false;
-      trk.follow = { q: T, far: true };
+      trk.q = T; trk.v = ZERO(); trk.boost = 1; trk.jumped = true; trk.settled = false; trk.jumpF = trk.lastF + 1; trk.moOk = 0;
+      trk.follow = { q: T, far: true }; trk.agrees = 1;
     } else {
       trk.follow = { q: T };
-      trk.settled = true;
+      trk.settled = true; trk.agrees++;
     }
+    trk.agreeAt = now;
     trk.proposal = { q: T, d: d / diag, src };
     return;
   }
@@ -537,34 +581,45 @@ function onFinder(f, quad, src) {
     // The AI pins corners outside the view to its edge, so compare with the tracked corners pinned the same way.
     const refC = ref.map(([x, y]) => [Math.min(gw, Math.max(0, x)), Math.min(gh, Math.max(0, y))]);
     const m = align(A, refC);
+    if (src === "ai") noteAI(m.d / Math.hypot(gw, gh), now);
     if (st.trace) st.events.push({ f, src, d: +(m.d / Math.hypot(gw, gh) * 100).toFixed(2), firm: trk.sideOk.every((n) => n >= 3), ok: trk.sideOk.join(",") });
     // An outline with all four sides on edges is trusted further than one with a side that's only a guess.
     const firm = trk.sideOk.every((n) => n >= 3) && !(trk.unsure >= 0 && f <= trk.unsure);
     const diag = Math.hypot(gw, gh);
-    if (m.d < (firm ? 0.025 : 0.012) * diag) {
-      trk.src = src; trk.differ = 0;
-      if (src === "ai") { trk.agreeAt = now; if (trk.unsure >= 0 && f > trk.unsure) trk.unsure = -1; }
+    if (m.d < (firm ? AGREE_FIRM : AGREE) * diag) {
+      trk.src = src; trk.differ = 0; trk.lastProp = null;
+      if (src === "ai") { trk.agreeAt = now; trk.agrees++; if (trk.unsure >= 0 && f > trk.unsure) trk.unsure = -1; }
       return;
     }
     // The finder sees the page somewhere else. It isn't always right (a desk edge or a shadow can fool the AI
     // by a few per cent), and the outline shouldn't be pulled to and fro: the next frame tries the finder's
     // outline, moved on to now, against the paper's edges, and keeps whichever sits on them better.
     const moved = firm || Ax === A ? m.q.map((p, i) => [p[0] + trk.q[i][0] - ref[i][0], p[1] + trk.q[i][1] - ref[i][1]]) : align(Ax, trk.q).q;
-    trk.proposal = { q: moved, d: m.d / diag, src };
+    // (does it say the same as the finder's last answer did, moved on as the outline has moved since?)
+    const L = trk.lastProp;
+    let run = 1;
+    if (L && trk.differ >= 1) {
+      const pm = L.q.map((p, i) => [p[0] + trk.q[i][0] - L.at[i][0], p[1] + trk.q[i][1] - L.at[i][1]]);
+      if (maxApart(align(moved, pm).q, pm) < 0.015 * diag) run = L.run + 1;
+    }
+    trk.lastProp = { q: moved, at: trk.q.map((p) => p.slice()), run };
+    trk.proposal = { q: moved, d: m.d / diag, src, run };
     trk.differ++;
     return;
   } else {
     trk.q = Ax;
   }
   trk.v = ZERO(); trk.follow = null; trk.settled = false;
-  trk.src = src; trk.boost = 2; trk.weak = 0; trk.strong = 0; trk.jumped = true;
+  trk.src = src; trk.boost = 2; trk.weak = 0; trk.strong = 0; trk.jumped = true; trk.jumpF = trk.lastF + 1; trk.moOk = 0;
   trk.sideOk = [0, 0, 0, 0];
-  if (src === "ai") trk.agreeAt = now;
+  trk.agrees = src === "ai" ? 1 : 0;
+  if (src === "ai") { trk.agreeAt = now; noteAI(0, now); }
 }
 
 // f: frame number in this worker's sequence; cf: the camera's frame number (frames the page skipped count).
 function track(f, cf) {
   trk.cfOf.set(f, cf);
+  trk.lastF = f;
   halfNow();
   if (trk.q && trk.src === "cv" && performance.now() - trk.cvAt > 700) trk.reset();   // classical find not confirmed
   if (!trk.q) { trk.hist.set(f, null); trk.cf = cf; prune(f); return null; }
@@ -597,19 +652,35 @@ function track(f, cf) {
     const around = alt.sides >= 3 && aa > 1.03 * aq && inter > 0.97 * aq && alt.score >= 0.6 * score;
     if (alt.sides >= 3 && sides >= 3 && (align(alt.q, q).d < 0.015 * diag || iou > 0.96)) {
       // The finder's outline lands on the same edges: it was just off a little. Nothing to change.
-      trk.differ = 0;
-    } else if (alt.score > score + 0.4 || around || (alt.sides >= 2 && sides < 2) || (trk.differ >= 6 && P.d > 0.05 && alt.score >= 1.5)) {
-      // Switch when the finder's outline sits clearly better on paper edges, or the finder has kept saying
-      // the page is well away from the outline and there are edges there (another sheet, say).
+      trk.differ = 0; trk.lastProp = null;
+      if (P.src === "ai") { trk.agreeAt = performance.now(); trk.aiD = 0; trk.far = 0; trk.agrees++; }
+    } else if ((alt.sides >= 2 && sides < 2) || (P.run >= 2 && P.d > 0.035 && alt.sides >= 3 && maxApart(alt.q, P.q) < 0.02 * diag) ||
+      (P.run >= 3 && sides < 3 && SWITCH === "ai")) {
+      // Switch when the current outline barely sits on edges and the finder's does, or when the finder has said
+      // twice running that the page is well away (further than it's usually off) and there are paper edges along
+      // its outline. Which edges are the page's is then the finder's call: a stack of sheets, or the boxes printed
+      // on a page, has strong edges that aren't the page's own.
       ({ q, sides, ok, score } = alt.sides >= 2 ? alt : { q: P.q, ...NONE });
       jumped = true;
-      trk.src = P.src; trk.differ = 0; trk.boost = 2; trk.sideOk = [0, 0, 0, 0];
-      if (P.src === "ai") trk.agreeAt = performance.now();
+      trk.src = P.src; trk.differ = 0; trk.lastProp = null; trk.boost = 0; trk.sideOk = [0, 0, 0, 0];
+      if (P.src === "ai") { trk.agreeAt = performance.now(); trk.aiD = 0; trk.far = 0; trk.agrees = 1; }
+    } else if (SWITCH === "ai" && alt.sides < 3 && sides === 4 && trk.sideOk.every((n) => n >= 3)) {
+      // The finder sees the page elsewhere, but there are no paper edges along its outline, while this outline
+      // sits on four: the finder is off a little (it can be by a few per cent), and the outline stands.
+      trk.differ = 0; trk.lastProp = null;
+      if (P.src === "ai") { trk.agreeAt = performance.now(); trk.aiD = 0; trk.far = 0; trk.agrees++; }
+    } else if (SWITCH === "edges" && (alt.score > score + 0.4 || around || (trk.differ >= 6 && P.d > 0.05 && alt.score >= 1.5))) {
+      // (the old way: switch when the finder's outline sits clearly better on edges)
+      ({ q, sides, ok, score } = alt.sides >= 2 ? alt : { q: P.q, ...NONE });
+      jumped = true;
+      trk.src = P.src; trk.differ = 0; trk.lastProp = null; trk.boost = 2; trk.sideOk = [0, 0, 0, 0];
+      if (P.src === "ai") { trk.agreeAt = performance.now(); trk.aiD = 0; trk.far = 0; trk.agrees = 1; }
     }
   }
   for (let i = 0; i < 4; i++) trk.sideOk[i] = ok[i] ? trk.sideOk[i] + 1 : 0;
   if (jumped) {
     trk.q = q; trk.v = ZERO(); trk.jumped = true; trk.weak = sides >= 2 ? 0 : 1; trk.strong = 0; trk.follow = null; trk.settled = false;
+    trk.jumpF = f; trk.moOk = 0;
   } else if (sides >= 2) {
     trk.v = q.map((p, i) => [0.5 * (p[0] - trk.q[i][0]) / gap + 0.5 * v[i][0], 0.5 * (p[1] - trk.q[i][1]) / gap + 0.5 * v[i][1]]);
     trk.q = q; trk.weak = 0; trk.follow = null; trk.moOk += gap;
@@ -815,6 +886,29 @@ function halfNow() {
   halve(grey, mo.half);
 }
 
+// Is the outline sure enough to show? Like CamScanner, the app shows it only while the AI agrees that the page is
+// there: about where the outline is (the AI's corners can be a few per cent off), or on the same paper edges. Not
+// while the AI sees no page or keeps seeing it well away from the outline, nor while part of the page is out of
+// view. A new outline waits for the AI to say so a second time, or for the paper's edges along it. Once shown, it
+// stays until the AI says otherwise twice running (or once, far off), so one odd answer doesn't make it blink.
+// The outline is followed all the while, so it's back as soon as it's confirmed.
+function confirmed() {
+  const was = trk.shown;
+  trk.shown = trk.cut = false;
+  if (!trk.q) return false;
+  const now = performance.now();
+  const edges = trk.sideOk.filter((n) => n >= 3).length >= 3;
+  let ok;
+  if (trk.src === "cv") ok = now - trk.cvAt < 700;
+  else if (trk.src !== "ai" || now - trk.aiAt > 1200 || trk.miss >= 2 || trk.far >= 2 || trk.aiD > 0.1) ok = false;
+  else ok = was || (trk.miss === 0 && trk.aiD < (edges ? 0.04 : 0.025) && (trk.agrees >= 2 || edges));
+  if (!ok) return false;
+  // the whole page in view, a little inside the edge of the picture (more so to come back on)
+  const m = (was ? 0.002 : 0.006) * Math.max(gw, gh);
+  if (!trk.q.every(([x, y]) => x > m && x < gw - m && y > m && y < gh - m)) { trk.cut = true; return false; }
+  return (trk.shown = true);
+}
+
 /* ---------- AI requests ---------- */
 const ai = { port: null, busy: false, frame: -1, sent: 0, seq: 0, ms: 0, n: 0, since: 0, hz: 0, ease: false, prev: null };
 function wantAI(now) {
@@ -846,10 +940,11 @@ function onAIResult(e) {
    When the page hands over its preview canvas, this worker draws each camera frame there itself, with the
    outline found in that same frame on top. The outline then sits exactly on the page as shown, instead of
    trailing the live video by a frame or two (which made it look shaky in a hand-held phone). */
-const view = { ctx: null, w: 0, h: 0, dpr: 1, steady: false };
+const view = { ctx: null, w: 0, h: 0, dpr: 1, steady: false, fade: 0 };
 const LOOK = { bg: "#050807", line: "#8DBCEB", fill: "rgba(141, 188, 235, .16)", okLine: "#76C898", okFill: "rgba(118, 200, 152, .2)" };
-// pic: the frame (a VideoFrame, or a still of it taken by the page). Returns whether it was drawn.
-function drawView(pic, quad) {
+// pic: the frame (a VideoFrame, or a still of it taken by the page); alpha: how strongly the outline is drawn (it
+// fades in and out). Returns whether the frame was drawn.
+function drawView(pic, quad, alpha = 1) {
   const c = view.ctx;
   if (!c || !view.w || !view.h) return false;
   const fw = pic.displayWidth || pic.width, fh = pic.displayHeight || pic.height;
@@ -858,7 +953,8 @@ function drawView(pic, quad) {
   const k = Math.min(view.w / fw, view.h / fh), dw = fw * k, dh = fh * k, ox = (view.w - dw) / 2, oy = (view.h - dh) / 2;
   if (dw < view.w - 0.5 || dh < view.h - 0.5) { c.fillStyle = LOOK.bg; c.fillRect(0, 0, view.w, view.h); }
   c.drawImage(pic, ox, oy, dw, dh);
-  if (!quad) return true;
+  if (!quad || alpha <= 0) return true;
+  c.globalAlpha = alpha;
   c.beginPath();
   for (let i = 0; i < 4; i++) { const X = ox + quad[i][0] * dw, Y = oy + quad[i][1] * dh; if (i) c.lineTo(X, Y); else c.moveTo(X, Y); }
   c.closePath();
@@ -867,6 +963,7 @@ function drawView(pic, quad) {
   c.lineWidth = 3 * view.dpr; c.lineJoin = "round";
   c.strokeStyle = view.steady ? LOOK.okLine : LOOK.line;
   c.stroke();
+  c.globalAlpha = 1;
   return true;
 }
 function clearView() {
@@ -977,9 +1074,12 @@ async function onFrameMsg(m) {
     self.postMessage({ type: "quad", seq: f, epoch: m.epoch, quad: null, error: String((err && err.message) || err) });
     return;
   }
+  const shown = res && (st.gate === false || confirmed()) ? res.quad : null;
+  // (the outline fades in and out over a few frames rather than blinking on and off)
+  view.fade = shown ? Math.min(1, view.fade + 0.34) : Math.max(0, view.fade - 0.25);
   let drawn = false;
   const pic = vf || still;
-  if (pic && view.ctx) { try { drawn = drawView(pic, res ? res.quad : null); } catch (_) { /* drawing isn't essential */ } }
+  if (pic && view.ctx) { try { drawn = drawView(pic, shown || (res && res.quad), view.fade); } catch (_) { /* drawing isn't essential */ } }
   close();
   if (st.pad) { const end = t0 + st.pad; while (performance.now() < end) { /* test hook: a slower phone */ } }
   const ms = performance.now() - t0;
@@ -988,9 +1088,9 @@ async function onFrameMsg(m) {
   if (!st.since) st.since = t0;
   if (t0 - st.since >= 1000) { const hz = (st.n * 1000) / (t0 - st.since); st.hz = st.hz ? st.hz * 0.7 + hz * 0.3 : hz; st.n = 0; st.since = t0; }
   self.postMessage({
-    type: "quad", seq: f, epoch: m.epoch, quad: res ? res.quad : null, sides: res ? res.sides : 0, src: res ? trk.src : "", jump: !!trk.jumped, drawn,
+    type: "quad", seq: f, epoch: m.epoch, quad: shown, cut: !!(res && trk.cut), sides: res ? res.sides : 0, src: res ? trk.src : "", jump: !!trk.jumped, drawn,
     sig: signature(), stats: { liveMs: st.ms, liveHz: st.hz, aiMs: ai.ms, aiHz: ai.hz, way: st.way },
-    trace: st.trace ? { ok: trk.sideOk.join(","), ev: st.events.splice(0), ts, wt: performance.now() } : undefined,
+    trace: st.trace ? { ok: trk.sideOk.join(","), ev: st.events.splice(0), ts, wt: performance.now(), tq: res ? res.quad : null } : undefined,
   });
   trk.jumped = false;
   keepFrame();
@@ -1042,5 +1142,11 @@ self.onmessage = (e) => {
   else if (m.type === "view-off") { clearView(); view.w = view.h = 0; }
   else if (m.type === "look") view.steady = !!m.steady;
   else if (m.type === "ease") ai.ease = !!m.on;
-  else if (m.type === "debug") { st.pad = m.liveMs || 0; st.trace = !!m.trace; st.forceRead = m.read || ""; }
+  else if (m.type === "debug") {
+    st.pad = m.liveMs || 0; st.trace = !!m.trace; st.forceRead = m.read || "";
+    if (m.pick) PICK = m.pick;
+    if (m.switch) SWITCH = m.switch;
+    if (m.gate !== undefined) st.gate = !!m.gate;
+    if (m.agree) { AGREE_FIRM = m.agree[0]; AGREE = m.agree[1]; }
+  }
 };
