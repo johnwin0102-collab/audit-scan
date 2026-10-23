@@ -148,6 +148,12 @@ function collectQuads(binary, out, W, H) {
 
 // Find the page in an RGBA Mat. Returns normalised corners (0..1) or null.
 function findQuad(src) {
+  const c = quadCandidates(src);
+  return c.length ? c[0].q : null;
+}
+
+// Every page-shaped outline the classical edge finder sees, best first (normalised corners).
+function quadCandidates(src) {
   const W = src.cols, H = src.rows;
   const gray = new cv.Mat();
   const blur = new cv.Mat();
@@ -174,9 +180,14 @@ function findQuad(src) {
   } finally {
     gray.delete(); blur.delete(); edges.delete(); th.delete(); k3.delete(); k9.delete();
   }
-  if (!cands.length) return null;
   cands.sort((a, b) => b.s - a.s);
-  return cands[0].q.map(([x, y]) => [x / W, y / H]);
+  const out = [];
+  for (const c of cands) {
+    const q = c.q.map(([x, y]) => [x / W, y / H]);
+    if (out.some((o) => maxDelta(o.q, q) < 0.01)) continue;   // the same outline found twice
+    out.push({ q, s: c.s });
+  }
+  return out;
 }
 
 function maxDelta(a, b) {
@@ -204,8 +215,16 @@ function drawToMat(source, maxEdge) {
   return { mat: cv.matFromImageData(ctx.getImageData(0, 0, w, h)), canvas, w, h };
 }
 
-async function blobToMat(blob, maxEdge = 100000) {
-  const bmp = await createImageBitmap(blob);
+// Decode a stored photo. With its size known, a big photo is decoded straight to the smaller size.
+async function blobToMat(blob, maxEdge = 100000, w0 = 0, h0 = 0) {
+  let bmp;
+  const s = w0 && h0 ? Math.min(1, maxEdge / Math.max(w0, h0)) : 1;
+  if (s < 1) {
+    try {
+      bmp = await createImageBitmap(blob, { resizeWidth: Math.max(1, Math.round(w0 * s)), resizeHeight: Math.max(1, Math.round(h0 * s)), resizeQuality: "medium" });
+    } catch (_) { bmp = null; }
+  }
+  if (!bmp) bmp = await createImageBitmap(blob);
   try { return drawToMat(bmp, maxEdge).mat; } finally { bmp.close(); }
 }
 
@@ -262,15 +281,23 @@ function pageGeometry(src, q) {
   if (r && r / measured > 0.6 && r / measured < 1.6) {
     if (oh >= ow) ow = oh * r; else oh = ow / r;
   }
-  // Most fieldwork documents are A4; snap to the exact ratio when the page is close to it.
-  const long = Math.max(ow, oh), short = Math.min(ow, oh);
-  if (short > 0 && Math.abs(long / short - A4) / A4 < 0.07) {
-    if (oh >= ow) oh = ow * A4; else ow = oh * A4;
-  }
-  const s = Math.min(1, MAX_OUT / Math.max(ow, oh));
-  ow = Math.max(1, Math.round(ow * s));
-  oh = Math.max(1, Math.round(oh * s));
+  // Most fieldwork documents are A4: a page within 20% of A4's shape comes out exactly A4.
+  [ow, oh] = snapA4(ow, oh);
   return { p, ow, oh };
+}
+
+// Exact A4 proportions for a page within 20% of them, by growing the side that measured short
+// (perspective and bending only ever make a side look shorter); other shapes (receipts, cheques,
+// cards) keep theirs. Also caps the size at MAX_OUT.
+function snapA4(ow, oh) {
+  const long = Math.max(ow, oh), short = Math.min(ow, oh), r = long / short;
+  let w = ow, h = oh;
+  if (short > 0 && Math.abs(r - A4) / A4 < 0.2) {
+    if (r > A4) { if (oh >= ow) w = oh / A4; else h = ow / A4; }
+    else if (oh >= ow) h = ow * A4; else w = oh * A4;
+  }
+  const s = Math.min(1, MAX_OUT / Math.max(w, h));
+  return [Math.max(1, Math.round(w * s)), Math.max(1, Math.round(h * s))];
 }
 
 // Crop and straighten the page described by normalised quad q.
@@ -285,18 +312,6 @@ function warp(src, q) {
   return dst;
 }
 
-// A bent page's corners understate one side, so once flattened a page within 20% of A4 is taken as A4
-// (growing the short-measured side; bending only ever shortens what the corners show).
-function snapFlattened(ow, oh) {
-  const long = Math.max(ow, oh), short = Math.min(ow, oh), r = long / short;
-  if (!(short > 0) || Math.abs(r - A4) / A4 >= 0.2) return [ow, oh];
-  let w = ow, h = oh;
-  if (r > A4) { if (oh >= ow) w = oh / A4; else h = ow / A4; }
-  else if (oh >= ow) h = ow * A4; else w = oh * A4;
-  const s = Math.min(1, MAX_OUT / Math.max(w, h));
-  return [Math.max(1, Math.round(w * s)), Math.max(1, Math.round(h * s))];
-}
-
 // Crop, straighten and, when asked, flatten a page that wasn't lying flat (flatten.js).
 // Returns { mat, flat } where flat says what flattening did (null when it wasn't tried).
 function cropPage(src, q, flatten) {
@@ -304,7 +319,7 @@ function cropPage(src, q, flatten) {
     const { p, ow, oh } = pageGeometry(src, q);
     try {
       const t0 = Date.now();
-      const r = flattenPage(src, p, ow, oh, snapFlattened);
+      const r = flattenPage(src, p, ow, oh, null);
       const i = r.info;
       return { mat: r.mat, flat: { applied: !!i.applied, passes: i.passes || 0, edges: i.edges || [], ms: Date.now() - t0, times: i.times } };
     } catch (err) {
@@ -519,6 +534,246 @@ function refineQuad(src, hint) {
   }
 }
 
+/* ---------- Choosing the page's corners ----------
+   The AI page finder is usually right, but when the page lies on or next to other papers it can
+   take them in too. The app therefore also asks the AI about crops around its first outline
+   ("second looks"). Each candidate outline is scored by how much of its four sides runs along a real
+   paper edge, how close its proportions are to A4, how much it overlaps the AI's first outline, plus
+   a small head start for that first outline. On 30 test scenes of pages lying on or beside other
+   papers, pages with corners more than 2% off fell from 8 to 1, and curled pages kept their corners. */
+
+// Two-scale step responses (box means either side of each pixel, across and down). An edge counts
+// only where both scales agree, so a thin printed line next to blank paper doesn't look like an edge.
+function stepImages(gray) {
+  const W = gray.cols, H = gray.rows;
+  const out = [];
+  const g32 = new cv.Mat();
+  gray.convertTo(g32, cv.CV_32F);
+  for (const [k, o] of [[5, 4], [11, 10]]) {
+    const b = new cv.Mat();
+    cv.blur(g32, b, new cv.Size(k, k));
+    const B = b.data32F, sx = new Float32Array(W * H), sy = new Float32Array(W * H);
+    for (let y = 0; y < H; y++) {
+      for (let x = o; x < W - o; x++) sx[y * W + x] = B[y * W + x + o] - B[y * W + x - o];
+    }
+    for (let y = o; y < H - o; y++) {
+      for (let x = 0; x < W; x++) sy[y * W + x] = B[(y + o) * W + x] - B[(y - o) * W + x];
+    }
+    b.delete();
+    out.push([sx, sy]);
+  }
+  g32.delete();
+  return { W, H, out };
+}
+
+// Share (0..1) of the segment a-b (pixels) that runs along a paper edge, with the paper on the side of
+// (cx, cy): brighter inside than out.
+function segmentSupport(st, a, b, cx, cy) {
+  const { W, H, out } = st;
+  const L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+  let nx = -(b[1] - a[1]) / L, ny = (b[0] - a[0]) / L;
+  if ((cx - (a[0] + b[0]) / 2) * nx + (cy - (a[1] + b[1]) / 2) * ny < 0) { nx = -nx; ny = -ny; }
+  const N = 48;
+  let hits = 0;
+  for (let k = 0; k < N; k++) {
+    const t = 0.04 + (0.92 * k) / (N - 1);
+    const px = a[0] + t * (b[0] - a[0]), py = a[1] + t * (b[1] - a[1]);
+    let best = -Infinity;
+    for (let o = -2; o <= 2; o++) {
+      const xi = Math.min(W - 1, Math.max(0, Math.round(px + o * nx))), yi = Math.min(H - 1, Math.max(0, Math.round(py + o * ny)));
+      const i = yi * W + xi;
+      let r = Infinity;
+      for (const [sx, sy] of out) r = Math.min(r, nx * sx[i] + ny * sy[i]);
+      if (r > best) best = r;
+    }
+    if (best > 6) hits++;
+  }
+  return hits / N;
+}
+
+// Share (0..1) of the side a-b along which a paper edge runs close by, following the edge as one
+// smooth path within `band` px either side (so a curled page's bent edge still counts).
+function pathSupport(st, a, b, cx, cy, band) {
+  const { W, H, out } = st;
+  const L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+  let nx = -(b[1] - a[1]) / L, ny = (b[0] - a[0]) / L;
+  if ((cx - (a[0] + b[0]) / 2) * nx + (cy - (a[1] + b[1]) / 2) * ny < 0) { nx = -nx; ny = -ny; }
+  const N = 40, M = 2 * band + 1;
+  const r = new Float32Array(N * M);
+  for (let k = 0; k < N; k++) {
+    const t = 0.04 + (0.92 * k) / (N - 1);
+    const px = a[0] + t * (b[0] - a[0]), py = a[1] + t * (b[1] - a[1]);
+    for (let j = 0; j < M; j++) {
+      const o = j - band;
+      const xi = Math.min(W - 1, Math.max(0, Math.round(px + o * nx))), yi = Math.min(H - 1, Math.max(0, Math.round(py + o * ny)));
+      const i = yi * W + xi;
+      let v = Infinity;
+      for (const [sx, sy] of out) v = Math.min(v, nx * sx[i] + ny * sy[i]);
+      r[k * M + j] = v;
+    }
+  }
+  // best smooth path (at most 3 px change between neighbouring samples)
+  let score = new Float32Array(M), next = new Float32Array(M);
+  const back = new Int16Array(N * M);
+  const clip = (v) => (v > 40 ? 40 : v < -20 ? -20 : v);
+  for (let j = 0; j < M; j++) score[j] = clip(r[j]);
+  for (let k = 1; k < N; k++) {
+    for (let j = 0; j < M; j++) {
+      let best = -Infinity, arg = j;
+      for (let d = -3; d <= 3; d++) {
+        const jj = j + d;
+        if (jj < 0 || jj >= M) continue;
+        const v = score[jj] - Math.abs(d);
+        if (v > best) { best = v; arg = jj; }
+      }
+      next[j] = best + clip(r[k * M + j]);
+      back[k * M + j] = arg;
+    }
+    const tmp = score; score = next; next = tmp;
+  }
+  let j = 0;
+  for (let q = 1; q < M; q++) if (score[q] > score[j]) j = q;
+  let hits = 0;
+  for (let k = N - 1; k >= 0; k--) {
+    if (r[k * M + j] > 6) hits++;
+    if (k) j = back[k * M + j];
+  }
+  return hits / N;
+}
+
+// For each side: is there a paper edge along it (allowing a bend), and does the side sit right on it?
+function edgeSupport(st, q) {
+  const P = q.map(([x, y]) => [x * st.W, y * st.H]);
+  const cx = (P[0][0] + P[1][0] + P[2][0] + P[3][0]) / 4, cy = (P[0][1] + P[1][1] + P[2][1] + P[3][1]) / 4;
+  const band = Math.max(6, Math.round(0.03 * Math.hypot(st.W, st.H)));
+  const near = [], on = [];
+  for (let i = 0; i < 4; i++) {
+    near.push(pathSupport(st, P[i], P[(i + 1) % 4], cx, cy, band));
+    on.push(segmentSupport(st, P[i], P[(i + 1) % 4], cx, cy));
+  }
+  return { near, on };
+}
+
+// One side of an otherwise good outline lies off the paper (on another sheet, or short of the edge):
+// slide it along its two neighbouring sides, in and out, to where a paper edge runs.
+function fixWeakSide(st, q, i) {
+  const W = st.W, H = st.H;
+  const P = q.map(([x, y]) => [x * W, y * H]);
+  const a = P[i], b = P[(i + 1) % 4], pa = P[(i + 3) % 4], pb = P[(i + 2) % 4];
+  const ua = [a[0] - pa[0], a[1] - pa[1]], ub = [b[0] - pb[0], b[1] - pb[1]];
+  let best = null;
+  for (let s = -0.45; s <= 0.6001; s += 0.01) {
+    for (let d = -0.05; d <= 0.0501; d += 0.025) {
+      const na = [a[0] + s * ua[0], a[1] + s * ua[1]], nb = [b[0] + (s + d) * ub[0], b[1] + (s + d) * ub[1]];
+      if (na[0] < 0 || na[1] < 0 || na[0] > W - 1 || na[1] > H - 1 || nb[0] < 0 || nb[1] < 0 || nb[0] > W - 1 || nb[1] > H - 1) continue;
+      const Q = P.slice();
+      Q[i] = na; Q[(i + 1) % 4] = nb;
+      const cx = (Q[0][0] + Q[1][0] + Q[2][0] + Q[3][0]) / 4, cy = (Q[0][1] + Q[1][1] + Q[2][1] + Q[3][1]) / 4;
+      const sup = segmentSupport(st, na, nb, cx, cy);
+      if (!best || sup > best.sup + 1e-9 || (Math.abs(sup - best.sup) < 1e-9 && Math.abs(s) < Math.abs(best.s))) best = { sup, s, Q };
+    }
+  }
+  if (!best || best.sup < 0.7) return null;
+  return best.Q.map(([x, y]) => [x / W, y / H]);
+}
+
+// Overlap (intersection over union) of two convex quads, by clipping one against the other.
+function quadIoU(a, b) {
+  const area = (p) => { let s = 0; for (let i = 0; i < p.length; i++) { const u = p[i], v = p[(i + 1) % p.length]; s += u[0] * v[1] - v[0] * u[1]; } return Math.abs(s) / 2; };
+  const orient = (p) => { let s = 0; for (let i = 0; i < p.length; i++) { const u = p[i], v = p[(i + 1) % p.length]; s += u[0] * v[1] - v[0] * u[1]; } return s >= 0 ? 1 : -1; };
+  let poly = a.map((p) => p.slice());
+  const sgn = orient(b);
+  for (let i = 0; i < 4 && poly.length; i++) {
+    const c = b[i], d = b[(i + 1) % 4];
+    const side = (p) => sgn * ((d[0] - c[0]) * (p[1] - c[1]) - (d[1] - c[1]) * (p[0] - c[0]));
+    const next = [];
+    for (let k = 0; k < poly.length; k++) {
+      const p = poly[k], r = poly[(k + 1) % poly.length], sp = side(p), sr = side(r);
+      if (sp >= 0) next.push(p);
+      if ((sp >= 0) !== (sr >= 0)) {
+        const t = sp / (sp - sr);
+        next.push([p[0] + t * (r[0] - p[0]), p[1] + t * (r[1] - p[1])]);
+      }
+    }
+    poly = next;
+  }
+  const inter = poly.length >= 3 ? area(poly) : 0;
+  const uni = area(a) + area(b) - inter;
+  return uni > 0 ? inter / uni : 0;
+}
+
+// Plausible page outline? Not tiny, corners not too sharp, proportions of real paper.
+function quadPlausible(q, W, H) {
+  const P = q.map(([x, y]) => [x * W, y * H]);
+  if (shoelace(P) < 0.06 * W * H) return false;
+  const ang = cornerAngles(P);
+  if (ang.some((x) => x < 40 || x > 140)) return false;
+  const r = realAspect(P, W, H);
+  return !r || (r > 0.12 && r < 8);   // long till receipts are fine
+}
+
+// 1 for exact A4 proportions (either way up), falling to 0 at 25% off.
+function a4Likeness(q, W, H) {
+  const r = realAspect(q.map(([x, y]) => [x * W, y * H]), W, H);
+  if (!r) return 0;
+  const rr = Math.max(r, 1 / r);
+  return Math.max(0, 1 - Math.abs(rr - A4) / 0.25);
+}
+
+// Choose the page's corners for `small` (RGBA, ~900 px). ai: the AI's first outline on this photo;
+// looks: its second looks at crops [{ q, src }]; live: the steady outline from the live view.
+// Returns { q, src, cands } with candidates best first.
+function pickQuad(small, ai, live, looks) {
+  const W = small.cols, H = small.rows;
+  const gray = new cv.Mat();
+  try {
+    cv.cvtColor(small, gray, cv.COLOR_RGBA2GRAY);
+    cv.GaussianBlur(gray, gray, new cv.Size(5, 5), 0);
+    const cands = [];
+    const add = (q, src, bonus) => {
+      if (!q || !quadPlausible(q, W, H)) return;
+      if (cands.some((c) => maxDelta(c.q, q) < 0.008)) return;
+      cands.push({ q, src, bonus });
+    };
+    if (ai) add(refineQuad(small, ai) || ai, "ai", 0.3);
+    for (const l of looks || []) add(refineQuad(small, l.q) || l.q, l.src || "look", 0);
+    if (live) add(refineQuad(small, live) || live, "live", 0);
+    if (!cands.length) for (const c of quadCandidates(small).slice(0, 5)) add(c.q, "edges", 0);
+    if (!cands.length) {
+      // Nothing looks like a page; keep what the AI said, as before.
+      const q = ai || live || null;
+      return { q, src: q ? (ai ? "ai" : "live") : null, cands: q ? [{ q, src: ai ? "ai" : "live" }] : [] };
+    }
+    const st = stepImages(gray);
+    const ref = ai || live;
+    const sum = (a) => a.reduce((t, v) => t + v, 0);
+    const score = (c) => {
+      const e = edgeSupport(st, c.q);
+      c.sides = e.near;
+      c.on = e.on;
+      c.iou = ref ? quadIoU(c.q, ref) : 0;
+      c.a4 = a4Likeness(c.q, W, H);
+      c.score = sum(e.near) + 0.5 * sum(e.on) + 0.5 * c.a4 + c.bonus + (ref ? 0.5 * c.iou : 0);
+    };
+    cands.forEach(score);
+    cands.sort((a, b) => b.score - a.score);
+    // The best outline has three good sides and one off the paper: move that side onto the edge.
+    const top = cands[0];
+    const weak = top.sides.map((v, i) => [v, i]).filter(([v]) => v < 0.5);
+    if (weak.length === 1 && top.sides.every((v, i) => i === weak[0][1] || v >= 0.75)) {
+      const q2 = fixWeakSide(st, top.q, weak[0][1]);
+      if (q2 && quadPlausible(q2, W, H)) {
+        const c2 = { q: q2, src: top.src + "+side", bonus: top.bonus };
+        score(c2);
+        if (c2.score > top.score + 0.2) { cands.unshift(c2); }
+      }
+    }
+    return { q: cands[0].q, src: cands[0].src, cands };
+  } finally {
+    gray.delete();
+  }
+}
+
 function rotate(mat, deg) {
   const code = { 90: cv.ROTATE_90_CLOCKWISE, 180: cv.ROTATE_180, 270: cv.ROTATE_90_COUNTERCLOCKWISE }[deg];
   if (code === undefined) return mat;
@@ -539,15 +794,18 @@ function detectSmall({ width, height, buffer }) {
 
 // A captured page: full camera frame (ImageBitmap) and, when the AI page finder saw a page,
 // its corners as a hint. Without a hint the classical edge finder looks for the page instead.
-async function capture({ bitmap, hint, filter, flatten }) {
+async function capture({ bitmap, hint, live, looks, filter, flatten, debug }) {
   const { mat: frame, canvas, w: frameW, h: frameH } = drawToMat(bitmap, MAX_FRAME);
   bitmap.close();
   try {
     const frameBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.88 });
     const small = shrink(frame, 900);
-    let q = null;
+    let q = null, pick = null, cands = null;
     try {
-      q = hint ? (refineQuad(small, hint) || hint) : findQuad(small);
+      const r = pickQuad(small, hint || null, live || null, looks || []);
+      q = r.q;
+      pick = r.src;
+      if (debug) cands = r.cands.map((c) => ({ q: c.q, src: c.src, score: +(c.score || 0).toFixed(3), sides: (c.sides || []).map((v) => +v.toFixed(2)), iou: +(c.iou || 0).toFixed(3), a4: +(c.a4 || 0).toFixed(2) }));
     } finally {
       small.delete();
     }
@@ -559,7 +817,8 @@ async function capture({ bitmap, hint, filter, flatten }) {
     warped.delete();
     const outputBlob = await matToBlob(out, 0.85);
     const thumbBlob = await thumbOf(out);
-    const res = { frameBlob, frameW, frameH, quad: q, auto, flat, warpedBlob, outputBlob, thumbBlob, w: out.cols, h: out.rows };
+    const res = { frameBlob, frameW, frameH, quad: q, auto, pick, flat, warpedBlob, outputBlob, thumbBlob, w: out.cols, h: out.rows };
+    if (cands) res.cands = cands;
     out.delete();
     return res;
   } finally {
@@ -588,7 +847,17 @@ async function render({ frameBlob, warpedBlob, quad, rotation, filter, flatten }
 }
 
 // Editor "Detect": refine the AI page finder's corners on the stored photo, or fall back to the edge finder.
-async function detectFrame({ frameBlob, hint }) {
-  const mat = await blobToMat(frameBlob, 900);
-  try { return { quad: hint ? (refineQuad(mat, hint) || hint) : findQuad(mat) }; } finally { mat.delete(); }
+async function detectFrame({ frameBlob, hint, looks, frameW, frameH }) {
+  const mat = await blobToMat(frameBlob, 900, frameW, frameH);
+  try {
+    const r = pickQuad(mat, hint || null, null, looks || []);
+    if (r.cands.length < 2) {
+      // Detect is a request for alternatives too: add the classical edge finder's outlines.
+      for (const c of quadCandidates(mat).slice(0, 4)) {
+        if (quadPlausible(c.q, mat.cols, mat.rows) && !r.cands.some((x) => maxDelta(x.q, c.q) < 0.008)) r.cands.push({ q: c.q, src: "edges" });
+      }
+      if (!r.q && r.cands.length) r.q = r.cands[0].q;
+    }
+    return { quad: r.q, cands: r.cands.map((c) => c.q) };
+  } finally { mat.delete(); }
 }

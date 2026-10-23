@@ -17,7 +17,7 @@ When a new version is published, the app shows **Update now** at the top of the 
 1. Enter the client (name as per SSM), FYE and audit area, then tap **Start scanning**.
 2. Pick a scan mode on the strip above the shutter (Auto suits most documents).
 3. Hold the phone over a page. The outline turns green and the page is captured automatically once it's steady. Turn to the next page and it captures again. The shutter button works any time. Tap **Undo** right after a capture to drop that page.
-4. Tap **Done** to review. Tap **×** on a page to delete it, or tap the page to crop, flatten, rotate, retake, reorder or change its mode. **Use this mode on all pages** applies one mode to the whole batch.
+4. Tap **Done** to review. Tap **×** on a page to delete it, or tap the page to crop, flatten, rotate, retake, reorder or change its mode. **Use this mode on all pages** applies one mode to the whole batch. In **Crop**, **Detect** puts the corners on the best outline it finds; tap it again to step through other outlines.
 5. Tap **Save PDF**, then **Save to Drive**. In the share list choose **Drive**, then **Audit Inbox** and the client's folder.
 
 The file is named for you, for example `Client name - FYE 31.03.2026 - Bank - 23.10.2026 1042.pdf`.
@@ -37,9 +37,9 @@ The file is named for you, for example `Client name - FYE 31.03.2026 - Bank - 23
 
 ## How page finding works
 
-An on-phone AI model (DocCornerNet, about 2 MB) finds the four page corners in every camera frame, even on cluttered desks and light tables. It runs on several CPU cores and looks at each new camera frame it can keep up with, and the outline glides between its results, so it follows the page smoothly. When a page edge is clearly visible, the app then snaps each side onto it for a tight crop. If the AI sees no page, a classic edge finder has a go. The crop also restores the page's true proportions, and near-A4 pages snap to exact A4.
+An on-phone AI model (DocCornerNet, about 2 MB) finds the four page corners in every camera frame, even on cluttered desks and light tables. It runs on several CPU cores and looks at each new camera frame it can keep up with, and the outline glides between its results, so it follows the page smoothly. When you capture, the AI also takes second looks at crops around its first outline. That separates a page from other papers it lies on or next to. The app keeps whichever outline best runs along real paper edges and has A4 proportions, then snaps each side onto the edge for a tight crop. If the AI sees no page, a classic edge finder has a go. The crop also restores the page's true proportions, and any page within about 20% of A4's shape comes out exactly A4 (receipts, cheques and cards keep their own shape).
 
-The footer of the batch screen shows how fast the page finder runs on your phone (for example "3 cores, 20 ms a look").
+The footer of the batch screen shows how fast the page finder runs on your phone (for example "3 cores, 20 ms a look") and how long each page takes to process.
 
 ## Flattening
 

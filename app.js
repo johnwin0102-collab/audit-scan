@@ -4,7 +4,7 @@
 "use strict";
 
 (() => {
-  const VERSION = "1.2.1";
+  const VERSION = "1.2.2";
 
   const AREAS = [
     { value: "Mixed", label: "Mixed (Claude sorts)", short: "" },
@@ -195,7 +195,7 @@
      canvas that's kept in main memory is slow (the whole frame has to come off the GPU first), so the
      picture is shrunk on the GPU and only the small result is read back. Phones differ, so the first
      frames are timed both ways and the faster way is kept. */
-  const stats = { grabMs: 0, mlMs: 0, rtMs: 0, looks: 0, lookHz: 0, since: 0, way: "" };
+  const stats = { grabMs: 0, mlMs: 0, rtMs: 0, looks: 0, lookHz: 0, since: 0, way: "", pageMs: 0 };
   const ema = (prev, x) => (prev ? prev * 0.9 + x * 0.1 : x);
   function makeGrabber(w, h) {
     return {
@@ -229,6 +229,14 @@
         }
         return { img, dt };
       },
+      // Part of the source (sx, sy, sw, sh in source pixels), squeezed into the canvas.
+      grabCrop(source, sx, sy, sw, sh) {
+        const ctx = this.canv[this.pick >= 0 ? this.pick : 0];
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "medium";
+        ctx.drawImage(source, sx, sy, sw, sh, 0, 0, this.w, this.h);
+        return ctx.getImageData(0, 0, this.w, this.h);
+      },
     };
   }
   const mlGrab = makeGrabber(ML_SIZE, ML_SIZE);
@@ -248,6 +256,34 @@
   async function findPage(source) {
     if (finder.state !== "ready") return null;
     return finderDetect(mlGrab.grab(source, false).img);
+  }
+
+  // Second looks: the AI again on crops around its first outline. When a page lies on or next to
+  // other papers, the first look can take them in; a crop that leaves them out usually doesn't.
+  // The image engine then keeps whichever outline best fits the paper's edges. Returns [{ q, src }].
+  async function secondLooks(source, q0) {
+    if (finder.state !== "ready" || !q0) return [];
+    const W = source.width, H = source.height;
+    const xs = q0.map((p) => p[0] * W), ys = q0.map((p) => p[1] * H);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+    const bw = x1 - x0, bh = y1 - y0, m = 0.08, c = 0.25;
+    const g = 0.3;
+    const boxes = [
+      ["bbox", x0 - m * bw, y0 - m * bh, x1 + m * bw, y1 + m * bh],
+      ["grow", x0 - g * bw, y0 - g * bh, x1 + g * bw, y1 + g * bh],
+      ["cut_top", x0 - m * bw, y0 + c * bh, x1 + m * bw, y1 + m * bh],
+      ["cut_bottom", x0 - m * bw, y0 - m * bh, x1 + m * bw, y1 - c * bh],
+      ["cut_left", x0 + c * bw, y0 - m * bh, x1 + m * bw, y1 + m * bh],
+      ["cut_right", x0 - m * bw, y0 - m * bh, x1 - c * bw, y1 + m * bh],
+    ];
+    const out = [];
+    for (const [src, a, b, e, f] of boxes) {
+      const bx = Math.max(0, a), by = Math.max(0, b), ex = Math.min(W, e), ey = Math.min(H, f);
+      if (ex - bx < 50 || ey - by < 50) continue;
+      const q = await finderDetect(mlGrab.grabCrop(source, bx, by, ex - bx, ey - by));
+      if (q) out.push({ src, q: q.map(([x, y]) => [(bx + x * (ex - bx)) / W, (by + y * (ey - by)) / H]) });
+    }
+    return out;
   }
 
   /* ---------- Navigation ---------- */
@@ -339,8 +375,10 @@
     if (stats.rtMs) {
       const n = finder.info.threads || 1;
       t += ` Page finder: ${plural(n, "core", "cores")}, ${Math.round(stats.rtMs)} ms a look`;
-      t += stats.lookHz ? `, ${Math.round(stats.lookHz)} looks a second.` : ".";
+      t += stats.lookHz ? `, ${Math.round(stats.lookHz)} looks a second` : "";
+      t += stats.way ? ` (${stats.way}).` : ".";
     }
+    if (stats.pageMs) t += ` Each page takes ${(stats.pageMs / 1000).toFixed(1)} s to process.`;
     el.verText.textContent = t;
   }
 
@@ -792,9 +830,11 @@
     let bitmap;
     try { bitmap = await createImageBitmap(el.video); }
     catch (_) { toast("That frame couldn't be captured. Try again."); return; }
-    // Ask the AI page finder about this exact frame; fall back to what the preview saw.
-    const hint = finder.state === "ready" ? await findPage(bitmap) : previewQuad;
-    await processCapture(bitmap, hint);
+    // Ask the AI page finder about this exact frame. The steady outline from the live view goes along
+    // as a second opinion; the engine keeps whichever outline best matches the paper's edges.
+    const hint = finder.state === "ready" ? await findPage(bitmap) : null;
+    const looks = hint ? await secondLooks(bitmap, hint) : [];
+    await processCapture(bitmap, hint, previewQuad, looks);
   }
 
   async function importFiles(files) {
@@ -807,12 +847,13 @@
       try { bitmap = await createImageBitmap(f); }
       catch (_) { failed++; continue; }
       const hint = await findPage(bitmap);
-      if (await processCapture(bitmap, hint)) done++; else failed++;
+      const looks = hint ? await secondLooks(bitmap, hint) : [];
+      if (await processCapture(bitmap, hint, null, looks)) done++; else failed++;
     }
     toast(`Imported ${plural(done, "page", "pages")}` + (failed ? `. ${failed} couldn't be read.` : "."));
   }
 
-  async function processCapture(bitmap, hint) {
+  async function processCapture(bitmap, hint, live = null, looks = []) {
     const batch = S.batch;
     const page = { id: uid(), batchId: batch.id, createdAt: Date.now(), filter: defaultFilter(), rotation: 0, flat: true, status: "processing" };
     // Retake: the new page takes the old page's place.
@@ -830,9 +871,12 @@
     updateCounter();
     if (S.screen === "review") renderReview();
     try {
-      const r = await engine.call("capture", { bitmap, hint, filter: page.filter, flatten: page.flat }, [bitmap]);
+      const t0 = performance.now();
+      const r = await engine.call("capture", { bitmap, hint, live, looks, filter: page.filter, flatten: page.flat, debug: !!window.__auditScanDebug }, [bitmap]);
+      stats.pageMs = ema(stats.pageMs, performance.now() - t0);
+      if (r.cands) page.cands = r.cands;
       Object.assign(page, {
-        status: "ready", frame: r.frameBlob, frameW: r.frameW, frameH: r.frameH, quad: r.quad, auto: r.auto, flatInfo: r.flat,
+        status: "ready", frame: r.frameBlob, frameW: r.frameW, frameH: r.frameH, quad: r.quad, auto: r.auto, pick: r.pick, flatInfo: r.flat,
         warped: r.warpedBlob, output: r.outputBlob, thumb: r.thumbBlob, w: r.w, h: r.h,
       });
       if (S.batch !== batch || !batch.pageIds.includes(page.id)) return false;   // discarded meanwhile
@@ -1239,24 +1283,40 @@
     drag = null;
     drawCrop();
   }
+  // Detect: the best outline first; tapping again steps through the other outlines found.
   async function cropDetect() {
     const p = curPage();
     if (!p || S.editor.busy) return;
-    setBusy(true);
-    try {
-      let hint = null;
-      if (finder.state === "ready") {
-        const bmp = await createImageBitmap(p.frame);
-        try { hint = await findPage(bmp); } finally { bmp.close(); }
+    const ed = S.editor;
+    if (!ed.detected) {
+      setBusy(true);
+      try {
+        let hint = null, looks = [];
+        if (finder.state === "ready") {
+          const s = Math.min(1, 1280 / Math.max(p.frameW || 1280, p.frameH || 1280));
+          const bmp = p.frameW
+            ? await createImageBitmap(p.frame, { resizeWidth: Math.round(p.frameW * s), resizeHeight: Math.round(p.frameH * s), resizeQuality: "medium" })
+            : await createImageBitmap(p.frame);
+          try {
+            hint = await findPage(bmp);
+            if (hint) looks = await secondLooks(bmp, hint);
+          } finally { bmp.close(); }
+        }
+        const r = await engine.call("detectFrame", { frameBlob: p.frame, hint, looks, frameW: p.frameW, frameH: p.frameH });
+        ed.detected = r.cands && r.cands.length ? r.cands : r.quad ? [r.quad] : [];
+      } catch (_) {
+        toast("Edge detection didn't work this time.");
+        return;
+      } finally {
+        setBusy(false);
       }
-      const r = await engine.call("detectFrame", { frameBlob: p.frame, hint });
-      if (r.quad) { S.editor.quad = r.quad; drawCrop(); }
-      else toast("No page edges found. Drag the corners by hand.");
-    } catch (_) {
-      toast("Edge detection didn't work this time.");
-    } finally {
-      setBusy(false);
     }
+    const list = ed.detected;
+    if (!list.length) { toast("No page edges found. Drag the corners by hand."); return; }
+    const at = ed.quad ? list.findIndex((q) => maxDelta(q, ed.quad) < 0.006) : -1;
+    ed.quad = list[at >= 0 ? (at + 1) % list.length : 0].map((pt) => pt.slice());
+    drawCrop();
+    if (list.length > 1) toast(at >= 0 ? `Outline ${((at + 1) % list.length) + 1} of ${list.length}. Tap Detect again for another.` : "Tap Detect again to try another outline.");
   }
   function cropFull() {
     if (!S.editor) return;
