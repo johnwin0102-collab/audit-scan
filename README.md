@@ -17,7 +17,7 @@ When a new version is published, the app shows **Update now** at the top of the 
 1. Enter the client (name as per SSM), FYE and audit area, then tap **Start scanning**.
 2. Pick a scan mode on the strip above the shutter (Auto suits most documents).
 3. Hold the phone over a page. The outline turns green and the page is captured automatically once it's steady. Turn to the next page and it captures again. The shutter button works any time. Tap **Undo** right after a capture to drop that page.
-4. Tap **Done** to review. Tap **×** on a page to delete it, or tap the page to crop, rotate, retake, reorder or change its mode. **Use this mode on all pages** applies one mode to the whole batch.
+4. Tap **Done** to review. Tap **×** on a page to delete it, or tap the page to crop, flatten, rotate, retake, reorder or change its mode. **Use this mode on all pages** applies one mode to the whole batch.
 5. Tap **Save PDF**, then **Save to Drive**. In the share list choose **Drive**, then **Audit Inbox** and the client's folder.
 
 The file is named for you, for example `Client name - FYE 31.03.2026 - Bank - 23.10.2026 1042.pdf`.
@@ -37,11 +37,19 @@ The file is named for you, for example `Client name - FYE 31.03.2026 - Bank - 23
 
 ## How page finding works
 
-An on-phone AI model (DocCornerNet, about 2 MB) finds the four page corners in every camera frame, even on cluttered desks and light tables. When a page edge is clearly visible, the app then snaps each side onto it for a tight crop. If the AI sees no page, a classic edge finder has a go. The crop also restores the page's true proportions, and near-A4 pages snap to exact A4.
+An on-phone AI model (DocCornerNet, about 2 MB) finds the four page corners in every camera frame, even on cluttered desks and light tables. It runs on several CPU cores and looks at each new camera frame it can keep up with, and the outline glides between its results, so it follows the page smoothly. When a page edge is clearly visible, the app then snaps each side onto it for a tight crop. If the AI sees no page, a classic edge finder has a go. The crop also restores the page's true proportions, and near-A4 pages snap to exact A4.
+
+The footer of the batch screen shows how fast the page finder runs on your phone (for example "3 cores, 20 ms a look").
+
+## Flattening
+
+A page that isn't lying flat (curled at a corner, lifted at the top, bowed, held in the hand) still looks bent after cropping. Audit Scan flattens it automatically: it finds what must be straight on a flat page (text lines, table rules, column lines and the paper edges), works out a smooth correction that straightens them all, and re-samples the photo through it, refining over up to three passes. Pages that are already flat are left exactly as cropped.
+
+In the page editor, **Flatten** is on by default; tap it to turn flattening off for that page (for example a page with deliberately curved artwork), and again to turn it back on. Flattening straightens lines and fills the frame with the page; it can't fully undo the squeeze where a page curls steeply away from the camera, so for best results hold the phone square over the page.
 
 ## Privacy
 
-Photos stay on the phone, and the AI model runs on the phone too. Nothing is uploaded anywhere until you save or share a PDF yourself. There is no account, server or tracking in this app; GitHub only hosts the app's code. Saved batches stay on the phone until you delete them.
+Photos stay on the phone, and the AI model and the flattening run on the phone too. Nothing is uploaded anywhere until you save or share a PDF yourself. There is no account, server or tracking in this app; GitHub only hosts the app's code. Saved batches stay on the phone until you delete them.
 
 ## Licences
 

@@ -1,5 +1,5 @@
 /* Audit Scan offline cache. Bump VERSION on every release so phones pick up the update. */
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 const CACHE = "audit-scan-" + VERSION;
 const APP = [
   "./",
@@ -9,6 +9,7 @@ const APP = [
   "db.js",
   "pdf.js",
   "cv-worker.js",
+  "flatten.js",
   "ml-worker.js",
   "manifest.webmanifest",
   "fonts/atkinson-hyperlegible-latin-400-normal.woff2",
@@ -50,6 +51,18 @@ self.addEventListener("message", (event) => {
   if (event.data === "skipWaiting") self.skipWaiting();
 });
 
+// GitHub Pages can't send the headers that let the page finder use several CPU cores
+// (cross-origin isolation), so the worker adds them to every file it serves. The app loads
+// nothing from other sites, so nothing is blocked by them.
+function isolated(res) {
+  if (!res || res.status === 0 || res.type === "opaque" || res.type === "opaqueredirect") return res;
+  const headers = new Headers(res.headers);
+  headers.set("Cross-Origin-Opener-Policy", "same-origin");
+  headers.set("Cross-Origin-Embedder-Policy", "require-corp");
+  headers.set("Cross-Origin-Resource-Policy", "same-origin");
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
 self.addEventListener("fetch", (event) => {
   const req = event.request;
   if (req.method !== "GET") return;
@@ -58,13 +71,13 @@ self.addEventListener("fetch", (event) => {
   event.respondWith((async () => {
     const cache = await caches.open(CACHE);
     const hit = await cache.match(req, { ignoreSearch: true });
-    if (hit) return hit;
+    if (hit) return isolated(hit);
     try {
-      return await fetch(req);
+      return isolated(await fetch(req));
     } catch (err) {
       if (req.mode === "navigate") {
         const shell = await cache.match("index.html");
-        if (shell) return shell;
+        if (shell) return isolated(shell);
       }
       throw err;
     }

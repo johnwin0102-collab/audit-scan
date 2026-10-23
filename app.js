@@ -4,7 +4,7 @@
 "use strict";
 
 (() => {
-  const VERSION = "1.1.0";
+  const VERSION = "1.2.0";
 
   const AREAS = [
     { value: "Mixed", label: "Mixed (Claude sorts)", short: "" },
@@ -36,8 +36,10 @@
   const DETECT_EDGE = 420;     // px, preview frame for the classical edge finder
   const ML_SIZE = 224;         // px, input of the AI page finder
   const ML_MIN_SCORE = 0.5;    // AI confidence needed to treat something as a page
-  const HOLD_MS = 900;         // page must be steady this long before an automatic capture
-  const STEADY = 0.022;        // corner movement (share of the frame) still counted as steady
+  const HOLD_MS = 800;         // page must be steady this long before an automatic capture
+  const STEADY = 0.025;        // corner drift (share of the frame) allowed while holding steady
+  const SMOOTH_MS = 45;        // outline catch-up time constant; lower follows faster but shakes more
+  const CLASSIC_GAP_MS = 250;  // how often the classical edge finder runs while the AI sees no page
   const COOLDOWN_MS = 1200;    // minimum gap between automatic captures
   const MAX_IN_FLIGHT = 2;     // captures being processed at once
   const UNDO_MS = 5000;        // how long the Undo button stays after a capture
@@ -132,7 +134,7 @@
     batch: null,          // the open batch
     pages: new Map(),     // page id -> page record
     urls: new Map(),      // page id -> thumbnail URL
-    saved: [],            // saved batches (kept 14 days)
+    saved: [],            // saved batches (kept until deleted)
     save: null,           // the save sheet's job
     editor: null,         // { id, crop, quad, busy, delArmed }
     retake: null,         // { id, filter } while retaking a page
@@ -141,7 +143,7 @@
   /* ---------- Workers: image engine (OpenCV) and AI page finder ---------- */
   function makeWorker(url, options, name) {
     return {
-      worker: null, seq: 0, pending: new Map(), state: "loading",
+      worker: null, seq: 0, pending: new Map(), state: "loading", info: {},
       start() {
         try { this.worker = new Worker(url, options); }
         catch (e) { this.fail(e); return; }
@@ -153,7 +155,7 @@
           if (ok) p.resolve(result); else p.reject(new Error(error));
         };
         this.worker.onerror = (e) => { e.preventDefault(); this.fail(e); };
-        this.call("init").then(() => { this.state = "ready"; renderEngine(); }, (e) => this.fail(e));
+        this.call("init").then((r) => { this.info = r || {}; this.state = "ready"; renderEngine(); }, (e) => this.fail(e));
       },
       call(type, payload = {}, transfer = []) {
         if (!this.worker || this.state === "failed") return Promise.reject(new Error(name + " isn't running."));
@@ -188,22 +190,64 @@
     }
   }
 
-  // The AI page finder takes a 224 x 224 picture of the whole frame.
-  const mlCanvas = document.createElement("canvas");
-  mlCanvas.width = mlCanvas.height = ML_SIZE;
-  const mlCtx = mlCanvas.getContext("2d", { willReadFrequently: true });
-  async function findPage(source) {
-    if (finder.state !== "ready") return null;
-    mlCtx.imageSmoothingEnabled = true;
-    mlCtx.imageSmoothingQuality = "medium";
-    mlCtx.drawImage(source, 0, 0, ML_SIZE, ML_SIZE);
-    const img = mlCtx.getImageData(0, 0, ML_SIZE, ML_SIZE);
+  /* ---------- Reading camera frames ----------
+     The AI page finder takes a 224 x 224 picture of the whole frame. Copying a 4K camera frame into a
+     canvas that's kept in main memory is slow (the whole frame has to come off the GPU first), so the
+     picture is shrunk on the GPU and only the small result is read back. Phones differ, so the first
+     frames are timed both ways and the faster way is kept. */
+  const stats = { grabMs: 0, mlMs: 0, rtMs: 0, looks: 0, lookHz: 0, since: 0, way: "" };
+  const ema = (prev, x) => (prev ? prev * 0.9 + x * 0.1 : x);
+  function makeGrabber(w, h) {
+    return {
+      w, h, pick: -1, times: [[], []],
+      canv: [false, true].map((slow) => {
+        const c = document.createElement("canvas");
+        c.width = w; c.height = h;
+        return c.getContext("2d", { willReadFrequently: slow, alpha: false });
+      }),
+      size(w2, h2) {
+        if (w2 === this.w && h2 === this.h) return;
+        this.w = w2; this.h = h2;
+        for (const ctx of this.canv) { ctx.canvas.width = w2; ctx.canvas.height = h2; }
+      },
+      grab(source, timed) {
+        const i = this.pick >= 0 ? this.pick : (this.times[0].length <= this.times[1].length ? 0 : 1);
+        const ctx = this.canv[i];
+        const t0 = performance.now();
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "medium";
+        ctx.drawImage(source, 0, 0, this.w, this.h);
+        const img = ctx.getImageData(0, 0, this.w, this.h);
+        const dt = performance.now() - t0;
+        if (timed && this.pick < 0) {
+          this.times[i].push(dt);
+          if (this.times[0].length >= 12 && this.times[1].length >= 12) {
+            const med = (a) => a.slice(2).sort((x, y) => x - y)[(a.length - 2) >> 1];
+            this.pick = med(this.times[0]) <= med(this.times[1]) ? 0 : 1;
+            if (this === mlGrab) stats.way = this.pick === 0 ? "gpu" : "cpu";
+          }
+        }
+        return { img, dt };
+      },
+    };
+  }
+  const mlGrab = makeGrabber(ML_SIZE, ML_SIZE);
+  const cvGrab = makeGrabber(DETECT_EDGE, DETECT_EDGE);
+
+  async function finderDetect(img) {
+    const t0 = performance.now();
     try {
       const r = await finder.call("detect", { buffer: img.data.buffer }, [img.data.buffer]);
+      stats.mlMs = ema(stats.mlMs, r.ms || 0);
+      stats.rtMs = ema(stats.rtMs, performance.now() - t0);
       return r.quad && r.score >= ML_MIN_SCORE && quadArea(r.quad) > 0.06 && quadOk(r.quad) ? r.quad : null;
     } catch (_) {
       return null;
     }
+  }
+  async function findPage(source) {
+    if (finder.state !== "ready") return null;
+    return finderDetect(mlGrab.grab(source, false).img);
   }
 
   /* ---------- Navigation ---------- */
@@ -286,6 +330,18 @@
     disarmDiscard();
     renderClients();
     renderSaved();
+    renderVersion();
+  }
+
+  // Footer: version, and once the camera has run, how fast the page finder is on this phone.
+  function renderVersion() {
+    let t = `Version ${VERSION}.`;
+    if (stats.rtMs) {
+      const n = finder.info.threads || 1;
+      t += ` Page finder: ${plural(n, "core", "cores")}, ${Math.round(stats.rtMs)} ms a look`;
+      t += stats.lookHz ? `, ${Math.round(stats.lookHz)} looks a second.` : ".";
+    }
+    el.verText.textContent = t;
   }
 
   let fieldTimer = 0;
@@ -417,14 +473,17 @@
 
   /* ---------- Camera ---------- */
   const cam = {
-    stream: null, track: null, torch: false, raf: 0, busy: false, wakeLock: null, res: "",
-    det: document.createElement("canvas"), sigC: document.createElement("canvas"),
-    lastQuad: null, lastQuadAt: 0, shown: null, steadySince: 0, misses: 0,
+    stream: null, track: null, torch: false, raf: 0, wakeLock: null, res: "",
+    lastQuad: null, lastQuadAt: 0, shown: null, showSteady: false, lastAnim: 0, anchor: null, steadySince: 0, misses: 0,
     armed: true, capturedSig: null, capturedAt: 0, sig: null, inFlight: 0, starting: false,
   };
-  const detCtx = cam.det.getContext("2d", { willReadFrequently: true });
-  cam.sigC.width = cam.sigC.height = 24;
-  const sigCtx = cam.sigC.getContext("2d", { willReadFrequently: true });
+  // Live page finding: the AI finder looks at every new camera frame it can keep up with; the classical
+  // edge finder runs alongside, a few times a second, only while the AI sees no page.
+  const live = {
+    frame: 0, vfc: 0, watching: false, useRaf: false,
+    mlBusy: false, mlFrame: -1, mlQuad: null, mlLast: 0,
+    cvBusy: false, cvFrame: -1, cvQuad: null, cvAt: 0, cvLast: 0,
+  };
 
   const autoOn = () => el.btnAuto.getAttribute("aria-pressed") === "true";
 
@@ -508,6 +567,9 @@
     if (el.undoBar) el.undoBar.hidden = true;
     cancelAnimationFrame(cam.raf);
     cam.raf = 0;
+    try { if (live.vfc && el.video.cancelVideoFrameCallback) el.video.cancelVideoFrameCallback(live.vfc); } catch (_) { /* gone */ }
+    live.vfc = 0;
+    live.watching = false;
     if (cam.stream) {
       cam.stream.getTracks().forEach((t) => t.stop());
       cam.stream = null;
@@ -519,7 +581,9 @@
   }
 
   function resetDetection() {
-    cam.lastQuad = null; cam.shown = null; cam.steadySince = 0; cam.misses = 0; cam.armed = true;
+    cam.lastQuad = null; cam.shown = null; cam.anchor = null; cam.steadySince = 0; cam.misses = 0; cam.armed = true;
+    cam.showSteady = false; cam.lostSince = performance.now();
+    live.mlQuad = null; live.cvQuad = null; live.cvAt = 0;
     drawQuad(null, false);
     setRing(0);
   }
@@ -545,45 +609,116 @@
     }
   }
 
-  function loopStart() { if (!cam.raf) cam.raf = requestAnimationFrame(tick); }
+  function loopStart() {
+    if (!cam.raf) { cam.lastAnim = 0; cam.raf = requestAnimationFrame(animate); }
+    watchFrames();
+  }
 
-  function tick() {
-    cam.raf = requestAnimationFrame(tick);
+  // Run the finders once per new camera frame (requestVideoFrameCallback), or once per screen
+  // refresh on browsers without it.
+  function watchFrames() {
     const v = el.video;
-    if (cam.busy || !cam.stream || v.readyState < 2 || !v.videoWidth) return;
-    if (finder.state !== "ready" && engine.state !== "ready") return;
-    const vw = v.videoWidth, vh = v.videoHeight;
-    const s = DETECT_EDGE / Math.max(vw, vh);
-    const w = Math.round(vw * s), h = Math.round(vh * s);
-    if (cam.det.width !== w || cam.det.height !== h) { cam.det.width = w; cam.det.height = h; }
-    detCtx.drawImage(v, 0, 0, w, h);
-    sigCtx.drawImage(cam.det, 0, 0, 24, 24);
-    cam.sig = signature(sigCtx.getImageData(0, 0, 24, 24).data);
-    cam.busy = true;
-    detectLive(v, w, h)
-      .then((q) => { if (cam.stream) onDetect(q); })
-      .catch(() => {})
-      .finally(() => { cam.busy = false; });
+    if (live.watching || !cam.stream) return;
+    live.watching = true;
+    if (!v.requestVideoFrameCallback) { live.useRaf = true; return; }
+    const onFrame = (_now, meta) => {
+      if (!cam.stream) { live.watching = false; return; }
+      live.frame = meta && meta.presentedFrames ? meta.presentedFrames : live.frame + 1;
+      live.vfc = v.requestVideoFrameCallback(onFrame);
+      pump();
+    };
+    live.vfc = v.requestVideoFrameCallback(onFrame);
   }
 
-  // AI page finder first; the classical edge finder covers frames where the AI sees no page
-  // (and everything, if the AI model couldn't load).
-  async function detectLive(v, w, h) {
-    if (finder.state === "ready") {
-      const q = await findPage(v);
-      if (q) return q;
+  function pump() {
+    const v = el.video;
+    if (!cam.stream || S.screen !== "camera" || v.readyState < 2 || !v.videoWidth) return;
+    const now = performance.now();
+    // While a capture is being processed, look at most 20 times a second to leave cores for it.
+    const ease = cam.inFlight > 0 && now - live.mlLast < 50;
+    if (finder.state === "ready" && !live.mlBusy && !ease && live.frame !== live.mlFrame) {
+      live.mlBusy = true;
+      live.mlFrame = live.frame;
+      live.mlLast = now;
+      const { img, dt } = mlGrab.grab(v, true);
+      stats.grabMs = ema(stats.grabMs, dt);
+      cam.sig = signatureOf(img.data, ML_SIZE, ML_SIZE);
+      finderDetect(img).then((q) => {
+        live.mlQuad = q;
+        countLook();
+        if (!cam.stream) return;
+        // When the AI sees no page, a fresh classical result fills in.
+        onDetect(q || (performance.now() - live.cvAt < 400 ? live.cvQuad : null));
+      }).finally(() => { live.mlBusy = false; pump(); });
     }
-    if (engine.state === "ready" && cam.inFlight === 0) {
-      const img = detCtx.getImageData(0, 0, w, h);
-      const r = await engine.call("detect", { width: w, height: h, buffer: img.data.buffer }, [img.data.buffer]);
-      return r.quad || null;
+    const needClassic = finder.state !== "ready" || (!live.mlQuad && now - live.cvLast > CLASSIC_GAP_MS);
+    if (engine.state === "ready" && needClassic && !live.cvBusy && cam.inFlight === 0 && live.frame !== live.cvFrame) {
+      live.cvBusy = true;
+      live.cvFrame = live.frame;
+      live.cvLast = now;
+      const s = DETECT_EDGE / Math.max(v.videoWidth, v.videoHeight);
+      cvGrab.size(Math.round(v.videoWidth * s), Math.round(v.videoHeight * s));
+      const { img } = cvGrab.grab(v, true);
+      if (finder.state !== "ready") cam.sig = signatureOf(img.data, cvGrab.w, cvGrab.h);
+      engine.call("detect", { width: cvGrab.w, height: cvGrab.h, buffer: img.data.buffer }, [img.data.buffer])
+        .then((r) => {
+          live.cvQuad = r.quad || null;
+          live.cvAt = performance.now();
+          if (cam.stream && finder.state !== "ready") { countLook(); onDetect(live.cvQuad); }
+        })
+        .catch(() => {})
+        .finally(() => { live.cvBusy = false; });
     }
-    return null;
   }
 
-  function signature(data) {
-    const out = new Uint8Array(data.length / 4);
-    for (let i = 0, j = 0; i < data.length; i += 4, j++) out[j] = (data[i] * 3 + data[i + 1] * 6 + data[i + 2]) / 10;
+  function countLook() {
+    const now = performance.now();
+    if (!stats.since) stats.since = now;
+    stats.looks++;
+    if (now - stats.since >= 1000) {
+      stats.lookHz = ema(stats.lookHz, (stats.looks * 1000) / (now - stats.since));
+      stats.looks = 0;
+      stats.since = now;
+    }
+  }
+
+  // The outline glides toward the latest corners every screen refresh, so it moves smoothly
+  // between finder results instead of jumping.
+  function animate(now) {
+    cam.raf = requestAnimationFrame(animate);
+    if (live.useRaf) { live.frame++; pump(); }
+    const dt = cam.lastAnim ? Math.min(100, now - cam.lastAnim) : 16;
+    cam.lastAnim = now;
+    const target = cam.lastQuad;
+    if (!target) {
+      if (cam.shown) { cam.shown = null; drawQuad(null, false); }
+      return;
+    }
+    if (!cam.shown) cam.shown = target.map((p) => p.slice());
+    else if (maxDelta(cam.shown, target) > 0.0004) cam.shown = lerpQuad(cam.shown, target, 1 - Math.exp(-dt / SMOOTH_MS));
+    else if (cam.drawnSteady === cam.showSteady) return;
+    cam.drawnSteady = cam.showSteady;
+    drawQuad(cam.shown, cam.showSteady);
+  }
+
+  // A 24 x 24 brightness sketch of the frame, used to notice the page being turned.
+  function signatureOf(data, w, h) {
+    const out = new Uint8Array(576);
+    for (let gy = 0, j = 0; gy < 24; gy++) {
+      const y0 = Math.floor((gy * h) / 24), y1 = Math.max(y0 + 1, Math.floor(((gy + 1) * h) / 24));
+      for (let gx = 0; gx < 24; gx++, j++) {
+        const x0 = Math.floor((gx * w) / 24), x1 = Math.max(x0 + 1, Math.floor(((gx + 1) * w) / 24));
+        let s = 0, n = 0;
+        for (let y = y0; y < y1; y += 2) {
+          for (let x = x0; x < x1; x += 2) {
+            const i = (y * w + x) * 4;
+            s += data[i] * 3 + data[i + 1] * 6 + data[i + 2];
+            n++;
+          }
+        }
+        out[j] = n ? s / (10 * n) : 0;
+      }
+    }
     return out;
   }
   function sigDiff(a, b) {
@@ -596,29 +731,29 @@
   function onDetect(quad) {
     const now = performance.now();
     if (quad) {
-      const moved = cam.lastQuad ? maxDelta(cam.lastQuad, quad) : 1;
-      cam.steadySince = moved < STEADY ? (cam.steadySince || now) : 0;
+      // Steady means the corners stay within STEADY of where they were when the hold began.
+      if (!cam.anchor || maxDelta(cam.anchor, quad) > STEADY) { cam.anchor = quad; cam.steadySince = now; }
       cam.lastQuad = quad;
       cam.lastQuadAt = now;
       cam.misses = 0;
-      cam.shown = cam.shown ? lerpQuad(cam.shown, quad, 0.55) : quad;
+      cam.lostSince = 0;
     } else {
       cam.misses++;
-      cam.steadySince = 0;
-      if (cam.misses >= 3) { cam.lastQuad = null; cam.shown = null; }
+      if (cam.misses >= 2) { cam.anchor = null; cam.steadySince = 0; }   // one missed look doesn't restart the hold
+      if (cam.misses >= 3) { cam.lastQuad = null; if (!cam.lostSince) cam.lostSince = now; }
     }
     // After a capture, wait until the scene changes (page turned, hand passed over, page lifted).
     if (!cam.armed && now - cam.capturedAt > COOLDOWN_MS) {
       if (cam.misses >= 3 || sigDiff(cam.sig, cam.capturedSig) > 14) cam.armed = true;
     }
     const auto = autoOn();
-    const progress = auto && cam.armed && cam.steadySince && cam.inFlight < MAX_IN_FLIGHT
+    const progress = auto && cam.armed && cam.lastQuad && cam.steadySince && cam.inFlight < MAX_IN_FLIGHT
       ? Math.min(1, (now - cam.steadySince) / HOLD_MS) : 0;
-    drawQuad(cam.shown, progress > 0);
+    cam.showSteady = progress > 0;
     setRing(progress);
     if (progress >= 1) { captureFromCamera(); return; }
     let hint;
-    if (!cam.lastQuad) hint = cam.misses > 25 ? "No page found. Try a darker background, or tap the shutter" : "Point the camera at a page";
+    if (!cam.lastQuad) hint = cam.lostSince && now - cam.lostSince > 3000 ? "No page found. Try a darker background, or tap the shutter" : "Point the camera at a page";
     else if (!cam.armed && auto) hint = "Captured. Turn to the next page";
     else if (auto) hint = cam.steadySince ? "Hold steady…" : "Page found";
     else hint = "Page found. Tap the shutter";
@@ -649,6 +784,8 @@
     cam.capturedAt = now;
     cam.capturedSig = cam.sig;
     cam.steadySince = 0;
+    cam.anchor = null;
+    cam.showSteady = false;
     setRing(0);
     flash();
     try { if (navigator.vibrate) navigator.vibrate(25); } catch (_) { /* no vibration */ }
@@ -677,7 +814,7 @@
 
   async function processCapture(bitmap, hint) {
     const batch = S.batch;
-    const page = { id: uid(), batchId: batch.id, createdAt: Date.now(), filter: defaultFilter(), rotation: 0, status: "processing" };
+    const page = { id: uid(), batchId: batch.id, createdAt: Date.now(), filter: defaultFilter(), rotation: 0, flat: true, status: "processing" };
     // Retake: the new page takes the old page's place.
     const retake = S.retake && batch.pageIds.includes(S.retake.id) ? S.retake : null;
     S.retake = null;
@@ -693,9 +830,9 @@
     updateCounter();
     if (S.screen === "review") renderReview();
     try {
-      const r = await engine.call("capture", { bitmap, hint, filter: page.filter }, [bitmap]);
+      const r = await engine.call("capture", { bitmap, hint, filter: page.filter, flatten: page.flat }, [bitmap]);
       Object.assign(page, {
-        status: "ready", frame: r.frameBlob, frameW: r.frameW, frameH: r.frameH, quad: r.quad, auto: r.auto,
+        status: "ready", frame: r.frameBlob, frameW: r.frameW, frameH: r.frameH, quad: r.quad, auto: r.auto, flatInfo: r.flat,
         warped: r.warpedBlob, output: r.outputBlob, thumb: r.thumbBlob, w: r.w, h: r.h,
       });
       if (S.batch !== batch || !batch.pageIds.includes(page.id)) return false;   // discarded meanwhile
@@ -897,7 +1034,9 @@
     const ids = S.batch.pageIds;
     const idx = ids.indexOf(p.id);
     el.edTitle.textContent = `Page ${idx + 1} of ${ids.length}`;
-    el.edMeta.textContent = [filterLabel(p.filter), p.rotation ? `rotated ${p.rotation}°` : "", p.auto === false ? "not cropped" : ""].filter(Boolean).join(" · ");
+    const flattened = p.flat === true && p.flatInfo && p.flatInfo.applied;
+    el.edMeta.textContent = [filterLabel(p.filter), flattened ? "flattened" : "", p.rotation ? `rotated ${p.rotation}°` : "",
+      p.auto === false ? "not cropped" : ""].filter(Boolean).join(" · ");
     if (edUrl) URL.revokeObjectURL(edUrl);
     edUrl = URL.createObjectURL(p.output);
     el.edImg.src = edUrl;
@@ -909,6 +1048,8 @@
     el.btnMoveUp.disabled = idx <= 0;
     el.btnMoveDown.disabled = idx >= ids.length - 1;
     el.btnCrop.disabled = !p.frame;
+    el.btnFlatten.disabled = !p.frame || p.auto === false;
+    el.btnFlatten.setAttribute("aria-pressed", String(p.flat === true));
     el.edTools.hidden = ed.crop;
     el.cropBar.hidden = !ed.crop;
     el.cropWrap.hidden = !ed.crop;
@@ -927,11 +1068,11 @@
     try {
       const next = Object.assign({}, p, changes);
       const req = recrop
-        ? { frameBlob: p.frame, quad: next.quad, rotation: next.rotation, filter: next.filter }
+        ? { frameBlob: p.frame, quad: next.quad, rotation: next.rotation, filter: next.filter, flatten: next.flat === true }
         : { warpedBlob: p.warped, rotation: next.rotation, filter: next.filter };
       const r = await engine.call("render", req);
       Object.assign(p, changes, { output: r.outputBlob, thumb: r.thumbBlob, w: r.w, h: r.h });
-      if (r.warpedBlob) p.warped = r.warpedBlob;
+      if (r.warpedBlob) { p.warped = r.warpedBlob; p.flatInfo = r.flat; }
       await DB.put("pages", p);
       setThumb(p);
       if (S.screen === "editor") renderEditor();
@@ -983,6 +1124,17 @@
     S.retake = { id: p.id, filter: p.filter };
     show("camera");
     toast("Retake: the next page you capture replaces this one.");
+  }
+  // Flatten on/off for this page (on by default). Re-crops from the stored photo.
+  function toggleFlatten() {
+    const p = curPage();
+    if (!p || !p.frame || !S.editor || S.editor.busy) return;
+    const on = p.flat !== true;
+    rerender(p, { flat: on }, true).then(() => {
+      if (!S.editor || curPage() !== p) return;
+      if (on) toast(p.flatInfo && p.flatInfo.applied ? "Page flattened." : "This page already looks flat, so nothing changed.");
+      else toast("Flattening off for this page.");
+    });
   }
   function rotatePage() {
     const p = curPage();
@@ -1310,7 +1462,7 @@
       "cropPoly", "cropHandles", "edBusy", "edTools", "filterChips", "btnMoveUp", "btnCrop", "btnRotate", "btnMoveDown",
       "cropBar", "btnCropAuto", "btnCropFull", "btnCropCancel", "btnCropApply", "saveSheet", "saveName", "saveInfo",
       "saveActions", "saveHelp", "btnShare", "btnDownload", "btnSaveCancel", "saveDone", "saveDoneText", "btnNewBatch",
-      "btnKeepBatch", "toast", "modeStrip", "undoBar", "undoText", "btnUndo", "btnApplyAll", "btnRetake", "btnDeleteAllSaved",
+      "btnKeepBatch", "toast", "modeStrip", "undoBar", "undoText", "btnUndo", "btnApplyAll", "btnRetake", "btnDeleteAllSaved", "btnFlatten",
     ];
     for (const id of ids) {
       el[id] = $(id);
@@ -1357,6 +1509,7 @@
     el.btnApplyAll.addEventListener("click", applyAll);
     el.btnDeleteAllSaved.addEventListener("click", onDeleteAllSaved);
     el.btnRotate.addEventListener("click", rotatePage);
+    el.btnFlatten.addEventListener("click", toggleFlatten);
     el.btnCrop.addEventListener("click", enterCrop);
     el.btnMoveUp.addEventListener("click", () => movePage(-1));
     el.btnMoveDown.addEventListener("click", () => movePage(1));
@@ -1388,7 +1541,7 @@
     fillAreas();
     fillFilters();
     fillModes();
-    el.verText.textContent = `Version ${VERSION}.`;
+    renderVersion();
     engine.start();
     finder.start();
     renderEngine();
@@ -1405,7 +1558,7 @@
     show("setup");
   }
 
-  window.__auditScan = { S, engine, finder, cam };   // read by the automated test
+  window.__auditScan = { S, engine, finder, cam, live, stats };   // read by the automated tests
   boot().catch((err) => {
     console.error(err);
     document.body.insertAdjacentHTML("afterbegin", '<p style="padding:16px">Audit Scan failed to start. Reload the page.</p>');

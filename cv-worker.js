@@ -3,7 +3,7 @@
 /* global cv */
 "use strict";
 
-self.importScripts("vendor/opencv.js");
+self.importScripts("vendor/opencv.js", "flatten.js");
 
 const MAX_FRAME = 3000;   // px, long edge of the stored capture (kept for re-cropping)
 const MAX_OUT = 2600;     // px, long edge of the cropped page
@@ -251,10 +251,10 @@ function insetQuad(q, t) {
 
 const isFull = (q) => q.every((pt, i) => Math.abs(pt[0] - FULL[i][0]) < 1e-6 && Math.abs(pt[1] - FULL[i][1]) < 1e-6);
 
-// Crop and straighten the page described by normalised quad q.
-function warp(src, q) {
+// Corners in pixels (pulled in slightly) and the output size for normalised quad q.
+function pageGeometry(src, q) {
   const W = src.cols, H = src.rows;
-  const p = (isFull(q) ? q : insetQuad(q, 0.008)).map(([x, y]) => [x * W, y * H]);
+  const p = (isFull(q) ? q : insetQuad(q, FLAT.INSET)).map(([x, y]) => [x * W, y * H]);
   let ow = Math.max(dist(p[0], p[1]), dist(p[3], p[2]));
   let oh = Math.max(dist(p[0], p[3]), dist(p[1], p[2]));
   // Correct the proportions for perspective; keep the longer measured side for resolution.
@@ -270,6 +270,12 @@ function warp(src, q) {
   const s = Math.min(1, MAX_OUT / Math.max(ow, oh));
   ow = Math.max(1, Math.round(ow * s));
   oh = Math.max(1, Math.round(oh * s));
+  return { p, ow, oh };
+}
+
+// Crop and straighten the page described by normalised quad q.
+function warp(src, q) {
+  const { p, ow, oh } = pageGeometry(src, q);
   const srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, p.flat());
   const dstPts = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, ow - 1, 0, ow - 1, oh - 1, 0, oh - 1]);
   const M = cv.getPerspectiveTransform(srcPts, dstPts);
@@ -277,6 +283,35 @@ function warp(src, q) {
   cv.warpPerspective(src, dst, M, new cv.Size(ow, oh), cv.INTER_LINEAR, cv.BORDER_REPLICATE, new cv.Scalar());
   srcPts.delete(); dstPts.delete(); M.delete();
   return dst;
+}
+
+// A bent page's corners understate one side, so once flattened a page within 20% of A4 is taken as A4
+// (growing the short-measured side; bending only ever shortens what the corners show).
+function snapFlattened(ow, oh) {
+  const long = Math.max(ow, oh), short = Math.min(ow, oh), r = long / short;
+  if (!(short > 0) || Math.abs(r - A4) / A4 >= 0.2) return [ow, oh];
+  let w = ow, h = oh;
+  if (r > A4) { if (oh >= ow) w = oh / A4; else h = ow / A4; }
+  else if (oh >= ow) h = ow * A4; else w = oh * A4;
+  const s = Math.min(1, MAX_OUT / Math.max(w, h));
+  return [Math.max(1, Math.round(w * s)), Math.max(1, Math.round(h * s))];
+}
+
+// Crop, straighten and, when asked, flatten a page that wasn't lying flat (flatten.js).
+// Returns { mat, flat } where flat says what flattening did (null when it wasn't tried).
+function cropPage(src, q, flatten) {
+  if (flatten && !isFull(q)) {
+    const { p, ow, oh } = pageGeometry(src, q);
+    try {
+      const t0 = Date.now();
+      const r = flattenPage(src, p, ow, oh, snapFlattened);
+      const i = r.info;
+      return { mat: r.mat, flat: { applied: !!i.applied, passes: i.passes || 0, edges: i.edges || [], ms: Date.now() - t0, times: i.times } };
+    } catch (err) {
+      console.warn("Flattening failed; using the plain crop", err);
+    }
+  }
+  return { mat: warp(src, q), flat: null };
 }
 
 // Estimate the paper's brightness everywhere, so shadows and uneven light can be divided out.
@@ -504,7 +539,7 @@ function detectSmall({ width, height, buffer }) {
 
 // A captured page: full camera frame (ImageBitmap) and, when the AI page finder saw a page,
 // its corners as a hint. Without a hint the classical edge finder looks for the page instead.
-async function capture({ bitmap, hint, filter }) {
+async function capture({ bitmap, hint, filter, flatten }) {
   const { mat: frame, canvas, w: frameW, h: frameH } = drawToMat(bitmap, MAX_FRAME);
   bitmap.close();
   try {
@@ -518,13 +553,13 @@ async function capture({ bitmap, hint, filter }) {
     }
     const auto = !!q;
     if (!q) q = FULL;
-    const warped = warp(frame, q);
+    const { mat: warped, flat } = cropPage(frame, q, auto && flatten !== false);
     const warpedBlob = await matToBlob(warped, 0.9);
     const out = applyFilter(warped, filter || "auto");
     warped.delete();
     const outputBlob = await matToBlob(out, 0.85);
     const thumbBlob = await thumbOf(out);
-    const res = { frameBlob, frameW, frameH, quad: q, auto, warpedBlob, outputBlob, thumbBlob, w: out.cols, h: out.rows };
+    const res = { frameBlob, frameW, frameH, quad: q, auto, flat, warpedBlob, outputBlob, thumbBlob, w: out.cols, h: out.rows };
     out.delete();
     return res;
   } finally {
@@ -532,12 +567,12 @@ async function capture({ bitmap, hint, filter }) {
   }
 }
 
-// Editor changes: re-crop from the stored frame, or re-filter/rotate the stored crop.
-async function render({ frameBlob, warpedBlob, quad, rotation, filter }) {
-  let warped, newWarped = null;
+// Editor changes: re-crop (and re-flatten) from the stored frame, or re-filter/rotate the stored crop.
+async function render({ frameBlob, warpedBlob, quad, rotation, filter, flatten }) {
+  let warped, newWarped = null, flat = null;
   if (frameBlob) {
     const frame = await blobToMat(frameBlob);
-    try { warped = warp(frame, quad || FULL); } finally { frame.delete(); }
+    try { ({ mat: warped, flat } = cropPage(frame, quad || FULL, !!flatten)); } finally { frame.delete(); }
     newWarped = await matToBlob(warped, 0.9);
   } else {
     warped = await blobToMat(warpedBlob);
@@ -547,7 +582,7 @@ async function render({ frameBlob, warpedBlob, quad, rotation, filter }) {
   out = rotate(out, rotation || 0);
   const outputBlob = await matToBlob(out, 0.85);
   const thumbBlob = await thumbOf(out);
-  const res = { warpedBlob: newWarped, outputBlob, thumbBlob, w: out.cols, h: out.rows };
+  const res = { warpedBlob: newWarped, flat, outputBlob, thumbBlob, w: out.cols, h: out.rows };
   out.delete();
   return res;
 }
