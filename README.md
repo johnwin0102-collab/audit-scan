@@ -37,9 +37,16 @@ The file is named for you, for example `Client name - FYE 31.03.2026 - Bank - 23
 
 ## How page finding works
 
-An on-phone AI model (DocCornerNet, about 2 MB) finds the four page corners in every camera frame, even on cluttered desks and light tables. It runs on several CPU cores and looks at each new camera frame it can keep up with, and the outline glides between its results, so it follows the page smoothly. When you capture, the AI also takes second looks at crops around its first outline. That separates a page from other papers it lies on or next to. The app keeps whichever outline best runs along real paper edges and has A4 proportions, then snaps each side onto the edge for a tight crop. If the AI sees no page, a classic edge finder has a go. The crop also restores the page's true proportions, and any page within about 20% of A4's shape comes out exactly A4 (receipts, cheques and cards keep their own shape).
+The live outline is found in two ways at once, both on the phone:
 
-The footer of the batch screen shows how fast the page finder runs on your phone (for example "3 cores, 20 ms a look") and how long each page takes to process.
+- **Edge snapping, every camera frame.** Each frame is shrunk to a 640 px greyscale picture, and each side of the outline is searched for the paper's edge nearby: a brightness step that holds at two scales, so a printed rule or a table column inside the page doesn't count, and that is the outermost such step, since the page's own edge lies outside everything printed on it. Each side is fitted with a straight line, or a gentle curve if the page isn't lying flat, and the corners are where the sides meet. This keeps the outline on the paper's edge while the phone moves, about 30 times a second, and it runs in its own worker so the camera preview stays smooth.
+- **The AI page finder, several times a second.** An on-phone AI model (DocCornerNet, about 2 MB) finds the page in the first place, even on cluttered desks and light tables, and checks that the outline hasn't slid onto something else; if it has, the outline starts again from the AI's answer. When there are no edges to hold on to (white paper on a white desk), the outline simply follows the AI.
+
+Between frames the outline is placed ahead by its recent motion and lightly smoothed, so it neither trails the page nor shakes. In tests with a moving phone, the outline stays within about 0.2% of the page's true corners when the phone is still and about 0.5% while it moves (version 1.2 trailed by about 2%).
+
+When you capture, the AI also takes second looks at crops around its first outline. That separates a page from other papers it lies on or next to. The app keeps whichever outline best runs along real paper edges and has A4 proportions, then snaps each side onto the edge for a tight crop. If the AI sees no page, a classic edge finder has a go. The crop also restores the page's true proportions, and any page within about 20% of A4's shape comes out exactly A4 (receipts, cheques and cards keep their own shape).
+
+The footer of the batch screen shows how the outline and the AI run on your phone (for example "Outline: 30 updates a second, 8 ms each (frame). AI: 3 cores, 30 ms a look, 8 a second.") and how long each page takes to process.
 
 ## Flattening
 

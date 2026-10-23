@@ -1,5 +1,5 @@
 /* Audit Scan offline cache. Bump VERSION on every release so phones pick up the update. */
-const VERSION = "1.2.2";
+const VERSION = "1.3";
 const CACHE = "audit-scan-" + VERSION;
 const APP = [
   "./",
@@ -11,6 +11,7 @@ const APP = [
   "cv-worker.js",
   "flatten.js",
   "ml-worker.js",
+  "live-worker.js",
   "manifest.webmanifest",
   "fonts/atkinson-hyperlegible-latin-400-normal.woff2",
   "fonts/atkinson-hyperlegible-latin-700-normal.woff2",

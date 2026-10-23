@@ -4,7 +4,7 @@
 "use strict";
 
 (() => {
-  const VERSION = "1.2.2";
+  const VERSION = "1.3";
 
   const AREAS = [
     { value: "Mixed", label: "Mixed (Claude sorts)", short: "" },
@@ -34,11 +34,16 @@
   const FILTER_ALIASES = { enhanced: "magic" };   // pages scanned with version 1.0
   const FULL = [[0, 0], [1, 0], [1, 1], [0, 1]];
   const DETECT_EDGE = 420;     // px, preview frame for the classical edge finder
+  const TRACK_EDGE = 640;      // px, long side of the frame the live outline snaps to edges in (live-worker.js)
   const ML_SIZE = 224;         // px, input of the AI page finder
   const ML_MIN_SCORE = 0.5;    // AI confidence needed to treat something as a page
   const HOLD_MS = 800;         // page must be steady this long before an automatic capture
   const STEADY = 0.025;        // corner drift (share of the frame) allowed while holding steady
-  const SMOOTH_MS = 45;        // outline catch-up time constant; lower follows faster but shakes more
+  // Outline on screen: a glide between updates (ms), and a One Euro filter that smooths more when the
+  // page is still and less when it moves (min: Hz when still, firm: the same when at least three sides
+  // sit on paper edges; beta: how fast it rises with speed). lead: how many frames ahead to place the
+  // outline from its recent motion, besides the frames shown since the one it was found in.
+  const TUNE = { showMs: 12, euro: { min: 3, firm: 12, beta: 25, dcut: 1 }, lead: 0.3 };
   const CLASSIC_GAP_MS = 250;  // how often the classical edge finder runs while the AI sees no page
   const COOLDOWN_MS = 1200;    // minimum gap between automatic captures
   const MAX_IN_FLIGHT = 2;     // captures being processed at once
@@ -179,6 +184,8 @@
 
   let failToastShown = false;
   function renderEngine() {
+    linkFinder();
+    if (finder.state === "failed" && tracker.worker) tracker.worker.postMessage({ type: "ai-off" });
     const st = engine.state;
     el.engineChip.className = "chip" + (st === "ready" ? " is-ok" : st === "failed" ? " is-bad" : "");
     el.engineChip.textContent = st === "ready" ? "Scanner ready" : st === "failed" ? "Scanner didn't load" : "Loading scanner";
@@ -195,7 +202,7 @@
      canvas that's kept in main memory is slow (the whole frame has to come off the GPU first), so the
      picture is shrunk on the GPU and only the small result is read back. Phones differ, so the first
      frames are timed both ways and the faster way is kept. */
-  const stats = { grabMs: 0, mlMs: 0, rtMs: 0, looks: 0, lookHz: 0, since: 0, way: "", pageMs: 0 };
+  const stats = { grabMs: 0, mlMs: 0, rtMs: 0, looks: 0, lookHz: 0, since: 0, way: "", pageMs: 0, liveMs: 0, liveHz: 0, aiHz: 0 };
   const ema = (prev, x) => (prev ? prev * 0.9 + x * 0.1 : x);
   function makeGrabber(w, h) {
     return {
@@ -224,7 +231,8 @@
           if (this.times[0].length >= 12 && this.times[1].length >= 12) {
             const med = (a) => a.slice(2).sort((x, y) => x - y)[(a.length - 2) >> 1];
             this.pick = med(this.times[0]) <= med(this.times[1]) ? 0 : 1;
-            if (this === mlGrab) stats.way = this.pick === 0 ? "gpu" : "cpu";
+            if (this === mlGrab && tracker.state !== "ready") stats.way = this.pick === 0 ? "gpu" : "cpu";
+            if (this === trackGrab) stats.way = this.pick === 0 ? "canvas gpu" : "canvas cpu";
           }
         }
         return { img, dt };
@@ -241,6 +249,113 @@
   }
   const mlGrab = makeGrabber(ML_SIZE, ML_SIZE);
   const cvGrab = makeGrabber(DETECT_EDGE, DETECT_EDGE);
+  const trackGrab = makeGrabber(64, 64);
+
+  /* ---------- Live outline worker ----------
+     Every camera frame goes to live-worker.js, which snaps the outline to the paper's edges in it and asks
+     the AI page finder (through a MessagePort, so the page isn't involved) where the page is. Frames go as
+     VideoFrames, copied in the worker, when that shows the same picture as the screen; otherwise the page
+     draws each frame small and sends the picture. */
+  const tracker = { worker: null, state: "off", linked: false, path: "", busy: false, seq: 0, epoch: 0, sentFrame: -1, sentAt: 0, src: "", vfFails: 0, stalls: 0 };
+  function startTracker() {
+    if (tracker.worker || tracker.state === "failed") return;
+    try { tracker.worker = new Worker("live-worker.js"); }
+    catch (e) { console.error("The live outline didn't start", e); tracker.state = "failed"; return; }
+    tracker.worker.onmessage = onTrackerMsg;
+    tracker.worker.onerror = (e) => {
+      e.preventDefault();
+      console.error("The live outline stopped", e.message || e);
+      tracker.state = "failed"; tracker.busy = false; tracker.src = "";
+    };
+    tracker.state = "ready";
+    linkFinder();
+  }
+  function linkFinder() {
+    if (tracker.state !== "ready" || tracker.linked || finder.state !== "ready") return;
+    const ch = new MessageChannel();
+    finder.worker.postMessage({ type: "port", port: ch.port1 }, [ch.port1]);
+    tracker.worker.postMessage({ type: "port", port: ch.port2 }, [ch.port2]);
+    tracker.linked = true;
+  }
+  function trackSize(v) {
+    const s = TRACK_EDGE / Math.max(v.videoWidth, v.videoHeight);
+    trackGrab.size(Math.max(16, Math.round(v.videoWidth * s)), Math.max(16, Math.round(v.videoHeight * s)));
+  }
+  // Is a VideoFrame copy the same picture as the video (same way up, same framing)? The worker compares
+  // one with a drawn copy of the same frame.
+  function checkFramePath(v) {
+    if (window.__auditScanForcePath) { tracker.path = window.__auditScanForcePath; return; }   // tests
+    let f = null;
+    if (typeof VideoFrame === "function") { try { f = new VideoFrame(v); } catch (_) { f = null; } }
+    if (!f) { tracker.path = "canvas"; return; }
+    trackSize(v);
+    const { img } = trackGrab.grab(v, false);
+    tracker.busy = true;
+    tracker.sentAt = performance.now();
+    try {
+      tracker.worker.postMessage({ type: "check", epoch: tracker.epoch, frame: f, rgba: img.data.buffer, w: trackGrab.w, h: trackGrab.h }, [f, img.data.buffer]);
+    } catch (_) {
+      try { f.close(); } catch (_e) { /* gone */ }
+      tracker.busy = false; tracker.path = "canvas";
+    }
+  }
+  function sendFrame(v) {
+    if (tracker.busy || live.frame === tracker.sentFrame) return;
+    if (!tracker.path) { checkFramePath(v); if (tracker.busy) return; }
+    const seq = ++tracker.seq;
+    if (tracker.path === "frame") {
+      let f = null;
+      try { f = new VideoFrame(v); }
+      catch (_) { if (++tracker.vfFails >= 3) tracker.path = "canvas"; return; }
+      tracker.busy = true; tracker.sentFrame = live.frame; tracker.sentAt = performance.now();
+      try { tracker.worker.postMessage({ type: "frame", seq, cf: live.frame, epoch: tracker.epoch, frame: f }, [f]); }
+      catch (_) { try { f.close(); } catch (_e) { /* gone */ } tracker.busy = false; tracker.path = "canvas"; }
+      return;
+    }
+    // Drawing frames costs the page time: on a phone where it's slow, draw fewer of them.
+    if (stats.grabMs > 12 && performance.now() - tracker.sentAt < stats.grabMs * 2.5) return;
+    trackSize(v);
+    const { img, dt } = trackGrab.grab(v, true);
+    stats.grabMs = ema(stats.grabMs, dt);
+    tracker.busy = true; tracker.sentFrame = live.frame; tracker.sentAt = performance.now();
+    tracker.worker.postMessage({ type: "frame", seq, cf: live.frame, epoch: tracker.epoch, rgba: img.data.buffer, w: trackGrab.w, h: trackGrab.h }, [img.data.buffer]);
+  }
+  function onTrackerMsg(e) {
+    const m = e.data || {};
+    if (m.epoch !== tracker.epoch) return;          // from before the camera restarted
+    if (m.type === "check") {
+      tracker.busy = false;
+      tracker.path = m.ok ? "frame" : "canvas";
+      if (m.ok) stats.way = "frame";
+      pump();
+      return;
+    }
+    if (m.type !== "quad") return;
+    tracker.busy = false;
+    if (m.fallback) tracker.path = "canvas";         // this phone's frames can't be copied: draw them instead
+    if (m.sig) cam.sig = m.sig;
+    if (m.stats) {
+      stats.liveMs = m.stats.liveMs; stats.liveHz = m.stats.liveHz; stats.aiHz = m.stats.aiHz;
+      if (m.stats.aiMs) stats.mlMs = m.stats.aiMs;
+    }
+    stats.rtMs = ema(stats.rtMs, performance.now() - tracker.sentAt);
+    tracker.src = m.src || "";
+    cam.sides = m.sides || 0;
+    if (m.trace && tracker.trace) tracker.trace.push({ seq: m.seq, cf: tracker.sentFrame, t: performance.now(), q: m.quad, ...m.trace });
+    // How fast the outline moves (per camera frame), to place it on frames shown before its next update.
+    const f = tracker.sentFrame, q = m.quad, p = cam.motion;
+    // (not across a jump to a new outline, and never faster than a hand moves a phone)
+    if (q && p.q && !m.jump && f > p.f && f - p.f <= 3 && maxDelta(q, p.q) < 0.08) {
+      const k = 1 / (f - p.f);
+      const v = q.map((c, i) => [(c[0] - p.q[i][0]) * k, (c[1] - p.q[i][1]) * k]);
+      p.v = p.v ? v.map((c, i) => [0.6 * c[0] + 0.4 * p.v[i][0], 0.6 * c[1] + 0.4 * p.v[i][1]]) : v;
+      if (p.v.some(([x, y]) => Math.abs(x) > 0.03 || Math.abs(y) > 0.03)) p.v = null;
+    } else p.v = null;
+    p.q = q; p.f = f;
+    if (cam.stream && S.screen === "camera") { countLook(); onDetect(m.quad); }
+    pump();                                          // a newer frame may be waiting
+  }
+  function setEase() { if (tracker.worker) tracker.worker.postMessage({ type: "ease", on: cam.inFlight > 0 }); }
 
   async function finderDetect(img) {
     const t0 = performance.now();
@@ -372,7 +487,11 @@
   // Footer: version, and once the camera has run, how fast the page finder is on this phone.
   function renderVersion() {
     let t = `Version ${VERSION}.`;
-    if (stats.rtMs) {
+    if (stats.liveHz) {
+      const n = finder.info.threads || 1;
+      t += ` Outline: ${Math.round(stats.liveHz)} updates a second, ${Math.round(stats.liveMs || 0)} ms each (${stats.way || "?"}).`;
+      if (stats.mlMs) t += ` AI: ${plural(n, "core", "cores")}, ${Math.round(stats.mlMs)} ms a look, ${Math.round(stats.aiHz || 0)} a second.`;
+    } else if (stats.rtMs) {
       const n = finder.info.threads || 1;
       t += ` Page finder: ${plural(n, "core", "cores")}, ${Math.round(stats.rtMs)} ms a look`;
       t += stats.lookHz ? `, ${Math.round(stats.lookHz)} looks a second` : "";
@@ -514,9 +633,11 @@
     stream: null, track: null, torch: false, raf: 0, wakeLock: null, res: "",
     lastQuad: null, lastQuadAt: 0, shown: null, showSteady: false, lastAnim: 0, anchor: null, steadySince: 0, misses: 0,
     armed: true, capturedSig: null, capturedAt: 0, sig: null, inFlight: 0, starting: false,
+    target: null, motion: { q: null, f: -1, v: null },
   };
-  // Live page finding: the AI finder looks at every new camera frame it can keep up with; the classical
-  // edge finder runs alongside, a few times a second, only while the AI sees no page.
+  // Live page finding: every new camera frame goes to the live outline worker (or, if that worker isn't
+  // running, the AI finder looks at every frame it can keep up with); the classical edge finder runs
+  // alongside, a few times a second, only while the AI sees no page.
   const live = {
     frame: 0, vfc: 0, watching: false, useRaf: false,
     mlBusy: false, mlFrame: -1, mlQuad: null, mlLast: 0,
@@ -619,9 +740,13 @@
   }
 
   function resetDetection() {
-    cam.lastQuad = null; cam.shown = null; cam.anchor = null; cam.steadySince = 0; cam.misses = 0; cam.armed = true;
+    cam.lastQuad = null; cam.shown = null; cam.target = null; cam.anchor = null; cam.steadySince = 0; cam.misses = 0; cam.armed = true;
     cam.showSteady = false; cam.lostSince = performance.now();
     live.mlQuad = null; live.cvQuad = null; live.cvAt = 0;
+    tracker.epoch++; tracker.busy = false; tracker.sentFrame = -1; tracker.src = "";
+    cam.motion = { q: null, f: -1, v: null };
+    if (tracker.worker) tracker.worker.postMessage({ type: "reset" });
+    euroReset();
     drawQuad(null, false);
     setRing(0);
   }
@@ -672,6 +797,42 @@
     const v = el.video;
     if (!cam.stream || S.screen !== "camera" || v.readyState < 2 || !v.videoWidth) return;
     const now = performance.now();
+    // A frame the worker never answered (it shouldn't happen): try drawn frames, then the old way.
+    if (tracker.state === "ready" && tracker.busy && now - tracker.sentAt > 1500) {
+      tracker.busy = false;
+      tracker.stalls++;
+      if (tracker.stalls >= 2) tracker.path = "canvas";
+      if (tracker.stalls >= 4) { tracker.state = "failed"; tracker.src = ""; }
+    }
+    if (tracker.state === "ready") sendFrame(v);
+    else legacyLook(v, now);
+    // The classical edge finder, while the AI sees no page (or there's no AI).
+    const aiPage = tracker.state === "ready" ? tracker.src === "ai" : !!live.mlQuad;
+    const needClassic = finder.state !== "ready" || (!aiPage && now - live.cvLast > CLASSIC_GAP_MS);
+    if (engine.state === "ready" && needClassic && !live.cvBusy && cam.inFlight === 0 && live.frame !== live.cvFrame) {
+      live.cvBusy = true;
+      live.cvFrame = live.frame;
+      live.cvLast = now;
+      const s = DETECT_EDGE / Math.max(v.videoWidth, v.videoHeight);
+      cvGrab.size(Math.round(v.videoWidth * s), Math.round(v.videoHeight * s));
+      const { img } = cvGrab.grab(v, true);
+      const seq = tracker.seq;
+      if (finder.state !== "ready" && tracker.state !== "ready") cam.sig = signatureOf(img.data, cvGrab.w, cvGrab.h);
+      engine.call("detect", { width: cvGrab.w, height: cvGrab.h, buffer: img.data.buffer }, [img.data.buffer])
+        .then((r) => {
+          live.cvQuad = r.quad || null;
+          live.cvAt = performance.now();
+          if (!cam.stream) return;
+          if (tracker.state === "ready") { if (r.quad) tracker.worker.postMessage({ type: "cv", seq, quad: r.quad }); }
+          else if (finder.state !== "ready") { countLook(); onDetect(live.cvQuad); }
+        })
+        .catch(() => {})
+        .finally(() => { live.cvBusy = false; });
+    }
+  }
+
+  // Without the live outline worker: the AI finder looks at each new frame it can keep up with.
+  function legacyLook(v, now) {
     // While a capture is being processed, look at most 20 times a second to leave cores for it.
     const ease = cam.inFlight > 0 && now - live.mlLast < 50;
     if (finder.state === "ready" && !live.mlBusy && !ease && live.frame !== live.mlFrame) {
@@ -689,24 +850,6 @@
         onDetect(q || (performance.now() - live.cvAt < 400 ? live.cvQuad : null));
       }).finally(() => { live.mlBusy = false; pump(); });
     }
-    const needClassic = finder.state !== "ready" || (!live.mlQuad && now - live.cvLast > CLASSIC_GAP_MS);
-    if (engine.state === "ready" && needClassic && !live.cvBusy && cam.inFlight === 0 && live.frame !== live.cvFrame) {
-      live.cvBusy = true;
-      live.cvFrame = live.frame;
-      live.cvLast = now;
-      const s = DETECT_EDGE / Math.max(v.videoWidth, v.videoHeight);
-      cvGrab.size(Math.round(v.videoWidth * s), Math.round(v.videoHeight * s));
-      const { img } = cvGrab.grab(v, true);
-      if (finder.state !== "ready") cam.sig = signatureOf(img.data, cvGrab.w, cvGrab.h);
-      engine.call("detect", { width: cvGrab.w, height: cvGrab.h, buffer: img.data.buffer }, [img.data.buffer])
-        .then((r) => {
-          live.cvQuad = r.quad || null;
-          live.cvAt = performance.now();
-          if (cam.stream && finder.state !== "ready") { countLook(); onDetect(live.cvQuad); }
-        })
-        .catch(() => {})
-        .finally(() => { live.cvBusy = false; });
-    }
   }
 
   function countLook() {
@@ -720,20 +863,62 @@
     }
   }
 
-  // The outline glides toward the latest corners every screen refresh, so it moves smoothly
-  // between finder results instead of jumping.
+  // Outline smoothing (a One Euro filter): when the corners barely move it averages strongly, so the
+  // outline doesn't shake; when they move fast it hardly averages, so the outline doesn't trail the page.
+  // All corners share one setting so the outline keeps its shape.
+  const euro = { x: null, dx: null, t: 0 };
+  function euroReset() { euro.x = null; }
+  function euroStep(q, now) {
+    let v = q;
+    if (euro.x) {
+      // keep the corner numbering of the outline on screen
+      const prev = [[euro.x[0], euro.x[1]], [euro.x[2], euro.x[3]], [euro.x[4], euro.x[5]], [euro.x[6], euro.x[7]]];
+      let best = Infinity;
+      for (const order of [q, [q[0], q[3], q[2], q[1]]]) {
+        for (let k = 0; k < 4; k++) {
+          const r = [0, 1, 2, 3].map((i) => order[(i + k) % 4]);
+          const d = maxDelta(r, prev);
+          if (d < best) { best = d; v = r; }
+        }
+      }
+    }
+    const x = [v[0][0], v[0][1], v[1][0], v[1][1], v[2][0], v[2][1], v[3][0], v[3][1]];
+    if (!euro.x) { euro.x = x; euro.dx = new Array(8).fill(0); euro.t = now; }
+    else {
+      const dt = Math.max(0.004, (now - euro.t) / 1000);
+      euro.t = now;
+      const alpha = (cut) => 1 / (1 + 1 / (2 * Math.PI * cut * dt));
+      const E = TUNE.euro, ad = alpha(E.dcut);
+      let speed = 0;
+      for (let i = 0; i < 8; i++) {
+        euro.dx[i] += ad * ((x[i] - euro.x[i]) / dt - euro.dx[i]);
+        speed = Math.max(speed, Math.abs(euro.dx[i]));
+      }
+      const a = alpha((cam.sides >= 3 ? E.firm : E.min) + E.beta * speed);
+      for (let i = 0; i < 8; i++) euro.x[i] += a * (x[i] - euro.x[i]);
+    }
+    const e = euro.x;
+    return [[e[0], e[1]], [e[2], e[3]], [e[4], e[5]], [e[6], e[7]]];
+  }
+
+  // Every screen refresh the outline glides the last bit toward the smoothed corners.
   function animate(now) {
     cam.raf = requestAnimationFrame(animate);
     if (live.useRaf) { live.frame++; pump(); }
     const dt = cam.lastAnim ? Math.min(100, now - cam.lastAnim) : 16;
     cam.lastAnim = now;
-    const target = cam.lastQuad;
+    let target = cam.lastQuad ? cam.target : null;
+    const mo = cam.motion;
+    if (target && mo.v && tracker.state === "ready") {
+      const ahead = clamp(live.frame - mo.f, 0, 2) + TUNE.lead;
+      target = target.map((c, i) => [c[0] + mo.v[i][0] * ahead, c[1] + mo.v[i][1] * ahead]);
+    }
     if (!target) {
       if (cam.shown) { cam.shown = null; drawQuad(null, false); }
       return;
     }
     if (!cam.shown) cam.shown = target.map((p) => p.slice());
-    else if (maxDelta(cam.shown, target) > 0.0004) cam.shown = lerpQuad(cam.shown, target, 1 - Math.exp(-dt / SMOOTH_MS));
+    else if (maxDelta(cam.shown, target) > 0.0002) cam.shown = lerpQuad(cam.shown, target, TUNE.showMs > 0 ? 1 - Math.exp(-dt / TUNE.showMs) : 1);
     else if (cam.drawnSteady === cam.showSteady) return;
     cam.drawnSteady = cam.showSteady;
     drawQuad(cam.shown, cam.showSteady);
@@ -771,8 +956,10 @@
     if (quad) {
       // Steady means the corners stay within STEADY of where they were when the hold began.
       if (!cam.anchor || maxDelta(cam.anchor, quad) > STEADY) { cam.anchor = quad; cam.steadySince = now; }
+      if (!cam.lastQuad) euroReset();
       cam.lastQuad = quad;
       cam.lastQuadAt = now;
+      cam.target = euroStep(quad, now);
       cam.misses = 0;
       cam.lostSince = 0;
     } else {
@@ -817,7 +1004,7 @@
     if (engine.state !== "ready") { toast("The scanner is still loading."); return; }
     if (!cam.stream || !S.batch || cam.inFlight >= MAX_IN_FLIGHT) return;
     const now = performance.now();
-    const previewQuad = cam.lastQuad && now - cam.lastQuadAt < 500 ? cam.lastQuad : null;
+    const previewQuad = cam.lastQuad && now - cam.lastQuadAt < 500 ? cam.lastQuad.map(([x, y]) => [clamp(x, 0, 1), clamp(y, 0, 1)]) : null;
     cam.armed = false;
     cam.capturedAt = now;
     cam.capturedSig = cam.sig;
@@ -868,6 +1055,7 @@
     }
     S.pages.set(page.id, page);
     cam.inFlight++;
+    setEase();
     updateCounter();
     if (S.screen === "review") renderReview();
     try {
@@ -910,6 +1098,7 @@
       return false;
     } finally {
       cam.inFlight--;
+      setEase();
       updateCounter();
       if (S.screen === "review") renderReview();
     }
@@ -1604,6 +1793,7 @@
     renderVersion();
     engine.start();
     finder.start();
+    startTracker();
     renderEngine();
     registerSW();
     try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (_) { /* best effort */ }
@@ -1618,7 +1808,15 @@
     show("setup");
   }
 
-  window.__auditScan = { S, engine, finder, cam, live, stats };   // read by the automated tests
+  // Read by the automated tests; debugSlow makes the AI and the live outline take longer, like a slower phone.
+  window.__auditScan = {
+    S, engine, finder, cam, live, stats, tracker, TUNE,
+    debugSlow(mlMs, liveMs, trace) {
+      if (finder.worker) finder.worker.postMessage({ type: "debug", minMs: mlMs || 0 });
+      if (tracker.worker) tracker.worker.postMessage({ type: "debug", liveMs: liveMs || 0, trace: !!trace });
+      if (trace) tracker.trace = [];
+    },
+  };
   boot().catch((err) => {
     console.error(err);
     document.body.insertAdjacentHTML("afterbegin", '<p style="padding:16px">Audit Scan failed to start. Reload the page.</p>');

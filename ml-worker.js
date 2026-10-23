@@ -1,6 +1,7 @@
 /* Audit Scan page finder: a small on-phone AI model (DocCornerNet, 224 x 224 input) that predicts
    the four page corners and how likely it is that a page is in view. Runs in its own worker so the
-   camera preview stays smooth while pages are being processed. */
+   camera preview stays smooth while pages are being processed. The page asks it about captures; the
+   live outline worker asks it about camera frames through a MessagePort of its own. */
 import * as ort from "./vendor/ml/ort.min.js";
 
 const SIZE = 224;
@@ -9,10 +10,11 @@ const STD = [0.229, 0.224, 0.225];
 
 // Several CPU cores need cross-origin isolation, which the app's service worker switches on.
 // Without it (first visit, before the service worker is running) the finder uses one core.
-// Three at most: the camera, the screen and the image engine need cores too.
+// Three at most: the camera, the screen, the live outline and the image engine need cores too.
 const THREADS = self.crossOriginIsolated ? Math.max(1, Math.min(3, Math.floor((navigator.hardwareConcurrency || 2) / 2))) : 1;
 
 let session = null;
+let minMs = 0;     // test hook: make each look take at least this long (a slower phone)
 
 const ready = (async () => {
   ort.env.wasm.wasmPaths = new URL("./vendor/ml/", self.location.href).href;
@@ -45,6 +47,7 @@ async function detect(buffer) {
     if (d.length === 8) coords = d;
     else if (d.length === 1) logit = d[0];
   }
+  if (minMs) { const wait = minMs - (performance.now() - t0); if (wait > 0) await new Promise((r) => setTimeout(r, wait)); }
   const ms = performance.now() - t0;
   if (!coords) return { quad: null, score: 0, ms };
   const quad = [0, 1, 2, 3].map((i) => [Math.min(1, Math.max(0, coords[2 * i])), Math.min(1, Math.max(0, coords[2 * i + 1]))]);
@@ -52,10 +55,9 @@ async function detect(buffer) {
   return { quad, score, ms };
 }
 
-// One request at a time: a capture's check and the live preview can overlap.
+// One request at a time: the live outline, a capture's checks and the editor can overlap.
 let queue = Promise.resolve();
-self.onmessage = (event) => {
-  const msg = event.data || {};
+function handle(msg, reply) {
   queue = queue.then(async () => {
     try {
       await ready;
@@ -63,9 +65,20 @@ self.onmessage = (event) => {
       if (msg.type === "init") result = { ok: true, threads: THREADS, isolated: !!self.crossOriginIsolated, cores: navigator.hardwareConcurrency || 0 };
       else if (msg.type === "detect") result = await detect(msg.buffer);
       else throw new Error("Unknown request: " + msg.type);
-      self.postMessage({ id: msg.id, ok: true, result });
+      reply({ id: msg.id, ok: true, result });
     } catch (err) {
-      self.postMessage({ id: msg.id, ok: false, error: String((err && err.message) || err) });
+      reply({ id: msg.id, ok: false, error: String((err && err.message) || err) });
     }
   });
+}
+
+self.onmessage = (event) => {
+  const msg = event.data || {};
+  if (msg.type === "port") {
+    const port = msg.port;
+    port.onmessage = (e) => handle(e.data || {}, (r) => port.postMessage(r));
+    return;
+  }
+  if (msg.type === "debug") { minMs = msg.minMs || 0; return; }
+  handle(msg, (r) => self.postMessage(r));
 };
