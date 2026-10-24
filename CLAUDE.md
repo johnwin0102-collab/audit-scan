@@ -36,27 +36,26 @@ Follow the release checklist in `dev/README.md`: replay suite against the releas
 `Audit Scan x.y.z: <what John will notice>`, push to `main`, check the Pages build. Then tell John to open the app and
 tap **Update now**.
 
-## Where things stand (1.3.3 released; branch `phone-tuning` not released, 24 October 2026)
+## Where things stand (1.3.4, 24 October 2026)
 
 - John's feedback up to 1.3.2: the live outline was "not calm and stable" and "still not very nice", on stacks of
   stapled A4 pages (a hand on them, phone held close). His reference is CamScanner (on his phone): no outline while the
   phone moves, a filled outline ~0.7 s after holding still, then it barely moves; clamped to the view for a page that
   overflows it; a generous crop (it took his thumb in rather than cutting the page).
 - 24 Oct: tested on his real phone (Honor 90, Chrome 155, camera 2448×3264 portrait at ~27 fps; see "Testing on John's
-  phone" below), seven recorded sessions. Found: his installed 1.3.3 was stuck in "video view" (outline drawn over the
-  live video, trailing it) because the first seconds after the camera opens were slow; the AI is often badly off on his
-  pages (7–40% of its answers are impossible shapes), so 1.3.3 shows the outline only 10–30% of the time ("page not
-  found" while pointing at the page); outlines snapped to folds, printed lines and the hand holding a curled booklet,
-  or got twisted, and crops cut strips off; the capture's second looks picked half pages.
-- Branch `phone-tuning` (all dev-tested, not released): video view no longer sticks, quick start, frames handed over one
-  ahead, faster blur; calm outline on screen; shape checks (no twisted or impossible outlines); outline shown when the
-  AI's page covers the same area; pulls outward to the AI's side; crop widened where the AI sees more page; cut second
-  looks handicapped. Replay suite: the outline followed is better than 1.3.3 in every condition, the outline shown about
-  as good (better clean). On his recordings the outline is shown 2–3× as often.
-- John's verdict on the branch (test copy): still weaker than CamScanner, which "knows what area I need". The limit is
-  the AI page finder (DocCornerNet lean, 224 px): every rule around it second-guesses a weak answer. Next: a stronger
-  on-device page finder (a better corner model, or page segmentation), judged offline on his recordings first.
-- Per-frame cost on his phone ~30 ms (drawing the view 23%, shrinking the frame 35%, copying 10%; tracking 4%).
+  phone" below), recorded sessions `rec_s1`..`rec_s12`. Found: his installed 1.3.3 was stuck in "video view" (outline
+  drawn over the live video, trailing it) because the first seconds after the camera opens were slow; the AI is often
+  badly off on his pages (7–40% of its answers are impossible shapes), so 1.3.3 showed the outline only 10–30% of the
+  time ("No page found" while pointing at the page); outlines snapped to folds, printed lines and the hand holding a
+  curled booklet, or got twisted, and crops cut strips off; the capture's second looks picked half pages.
+- 1.3.4: video view no longer sticks, quick start, frames handed over one ahead, calm outline, no twisted or impossible
+  outlines, outline shown when the AI's page covers the same area (2–3× as often on his recordings), crop widened where
+  the AI sees more page, cut second looks handicapped. Trade-off on the synthetic suite: `dev/scenarios.md`.
+- John's verdict before release: still weaker than CamScanner, which "knows what area I need". The limit is the AI page
+  finder (DocCornerNet lean, 224 px). Tried: SlimSAM / MobileSAM at capture (`dev/samcrop.py`, `dev/sam-worker.js`,
+  test copy only with `as.samTest`): SlimSAM fixed crops of pages on the desk, not hand-held ones, ~8 s a page on his
+  phone. Page-finder work paused at his request. Options left: scanning technique (flat on the desk, hands off), a paid
+  on-device web scanner SDK, or training our own page model.
 
 ## Testing on John's phone
 

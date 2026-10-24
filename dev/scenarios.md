@@ -61,25 +61,36 @@ or test that covers it.
 - Calm (1.3.4, `calmView`): the outline drawn is the followed outline, except when that goes somewhere the page didn't
   (judged against the print inside the drawn outline, `pageMotion`, sampled on a 6 x 6 grid in the part of the page in
   view): then the drawn outline stays with the page until the followed one is back with it or has stayed at its new
-  place for 2 frames (at most 15), and glides there at most 6 px a frame (at least 20% of the way). A followed outline
-  with fewer than 2 sides on edges (a guess from the AI's answers) is drifted to slowly (15% a frame; 50% with 2 sides)
-  unless more than 3 x 1.2% of the diagonal away.
-- Shapes (1.3.4, `shapedPx`): an outline of our own (snapped, followed or shown) with a corner under 60° or over 120°, or
-  opposite sides more than 25° off parallel, isn't taken: a snap like that is refused, a followed outline like that is
-  dropped (found afresh from the next AI answer; it once stayed twisted for seconds while a page was turned in the
-  hand), and one is never shown. The AI's answers get 50–130° and 30° (corners beyond the view pinned to its edge bend
-  them); an answer outside that says nothing to the show rule.
+  place for 2 frames (at most 15), and glides there at most 6 px a frame (at least 20% of the way). A change of 6%+ of
+  the diagonal towards the AI's last page-shaped answer is the page being found: glided to quickly, not held. A followed
+  outline with fewer than 2 sides on edges (a guess from the AI's answers) is drifted to slowly (15% a frame; 50% with 2
+  sides) unless more than 3 x 1.2% of the diagonal away.
+- Shapes (1.3.4, `shapedPx`): an outline of our own with a corner under 60° or over 120°, or opposite sides more than
+  25° off parallel: a snap like that is refused, a followed outline like that for 8 frames running is dropped (found
+  afresh from the next AI answer; one stayed twisted for seconds while John turned a page in his hand), and one is
+  never shown. The AI's answers get 50–130° and 30° (corners beyond the view pinned to its edge bend them); an answer
+  outside that says nothing to the show rule.
 - Shown (1.3.4): as before, or, when the AI's page and the outline cover about the same part of the view (the parts in
   view overlap 85%+, `overlapInView`), even with corners further apart; "well away" also needs the overlap under 75%.
-  On John's pages this doubled how often the outline is shown; on the synthetic stacks with a less exact AI it shows
-  more frames on the sheet under the page.
-- Widened (1.3.4, `widened`): with the phone about still, a corner of the AI's last page-shaped answer more than 3% of
-  the diagonal outside the outline is taken for the outline shown (and so the crop): a side on a fold, printed line or
-  hand inside a curled booklet page cut the crop. Pulls outward (`notePulls`): the AI twice running puts a side 4%+
-  further out at both ends (within 15%): the side goes there, edge or not.
+  On John's recordings the outline is shown 2-3x as often as in 1.3.3.
+- Crop (1.3.4, `widened`, message field `crop`): with the phone about still, a corner of the AI's last page-shaped answer
+  more than 3% of the diagonal outside the outline shown is taken for the crop (not for the outline on screen: there it
+  switched with each answer and the outline jumped). Outward pulls (`OUT_PULL`, the AI twice running putting a side 4%+
+  further out) are written but off: they made the outline jumpier on John's recordings. At capture, a second look at a
+  crop with part of the first outline cut away (`cut_*`) competes with a 0.4 handicap (it picked half pages).
+- Not taken up (1.3.4): ignoring the AI's odd-shaped answers altogether (`SHAPED`, hid good outlines too); the dark
+  band rule (`bandBeyond`, `BAND`: an edge with a dark stretch and paper beyond it, for fingers and printed bands; on
+  only where the AI puts a side further out, and then it changed nothing measurable).
 - Capture: the outline shown is the crop (refined on edges in the photo) when it really sits on 3+ edges there;
   otherwise AI, second looks and the classical finder compete. A cut-off page is cropped as it is (no perspective
   correction, no A4 snap, no flattening).
+
+## Known limits (1.3.4)
+
+- John's real pages (stapled booklets, curled at the binding, held in the hand, sheets underneath): the AI page finder
+  is often several per cent off and 7-40% of its answers are impossible shapes; the outline is still hidden 30-60% of
+  the time there and crops can still miss a strip. CamScanner does clearly better. SlimSAM at capture fixed crops of
+  pages on the desk but not of hand-held ones and takes ~8 s a page on his phone (experiment: `dev/sam-worker.js`).
 
 ## Known limits (1.3.3)
 
@@ -94,6 +105,28 @@ or test that covers it.
   matched the outline to the wrong frame number. Check the outline against the neighbouring frames (it matched the
   next frame exactly in every case seen) before believing a regression there.
 - Unused leftover in live-worker.js track(): `const within` (an inward-switch rule that was tried and dropped).
+
+## Results when 1.3.4 was released (same replay suite, outline as shown; fail = moving frames > 2% off)
+
+Mean over videos: 1.3.3 clean 7.9 / drop 8.5 / fuzz 5.5%, 1.3.4 9.1 / 8.2 / 8.0% (outline followed: 1.3.3 9.3 / 9.6 /
+8.3%, 1.3.4 9.3 / 8.0 / 6.6%). 1.3.4 shows the outline more (the overlap rule) and in the stack scenes more of the extra
+frames sit on the sheet under the page while the phone moves; still, both are within ~0.2-0.3%. That was taken for
+John's real pages, where 1.3.3 hid the outline most of the time (on his recordings 1.3.4 shows it 2-3x as often and is
+about as calm or calmer per frame; `replay_rec.js` against `rec_s3`..`rec_s7`). Single runs of one video can swing a
+few points either way on small changes (the outline locks on a frame earlier or later): compare means.
+
+| Video | 1.3.3 shown fail (clean / drop / fuzz) | 1.3.4 | 1.3.3 shown share | 1.3.4 |
+|---|---|---|---|---|
+| stack2 | 5 / 0 / 12% | 11 / 6 / 22% | 87 / 91 / 87% | 100 / 100 / 100% |
+| stack2_34 | 0 / 2 / 0% | 0 / 6 / 0% | 97 / 94 / 96% | 97 / 94 / 96% |
+| close | 12 / 16 / 13% | 12 / 11 / 12% | 100 / 100 / 100% | 100 / 100 / 100% |
+| spread | 0 / 2 / 0% | 0 / 7 / 0% | 97 / 93 / 97% | 97 / 95 / 97% |
+| clutter | 1 / 5 / 1% | 5 / 0 / 9% | 100 / 100 / 99% | 100 / 100 / 100% |
+| dim | 9 / 0 / 8% | 11 / 4 / 20% | 100 / 97 / 100% | 100 / 100 / 100% |
+| curl | 0 / 0 / 0% | 1 / 5 / 0% | 100 / 100 / 100% | 100 / 100 / 100% |
+| white | 0 / 10 / 13% | 0 / 0 / 14% | 97 / 100 / 71% | 100 / 100 / 100% |
+| realcam | 0 / 3 / 9% | 2 / 0 / 11% | 94 / 100 / 93% | 98 / 91 / 93% |
+| under | 91 / 81 / 16% | 91 / 78 / 16% | 93 / 96 / 100% | 100 / 96 / 100% |
 
 ## Results when 1.3.3 was released (replay suite, outline as shown; fail = moving frames > 2% off)
 

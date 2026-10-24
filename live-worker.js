@@ -558,7 +558,8 @@ const trk = {
   pull: [null, null, null, null], sidePull: null,   // per side: the AI's answers running that put the side a little inward (see notePulls)
   out: [false, false, false, false],   // per side: the AI's last answer put it well further out (see notePulls, bandBeyond)
   lastA: null,               // the AI's last answer that could be a page (grey px), with the outline then (see widened)
-  reset() { this.q = null; this.v = null; this.src = ""; this.miss = 0; this.weak = 0; this.boost = 0; this.hist.clear(); this.strong = 0; this.differ = 0; this.cf = -1; this.sideOk = [0, 0, 0, 0]; this.unsure = -1; this.proposal = null; this.lastProp = null; this.follow = null; this.moOk = 0; this.settled = false; this.jumpF = -1; this.aiD = 1; this.aiAt = 0; this.far = 0; this.aiO = 0; this.overlaps = 0; this.agrees = 0; this.shown = false; this.pull = [null, null, null, null]; this.sidePull = null; this.out = [false, false, false, false]; this.lastA = null; },
+  odd: 0,                    // frames in a row the outline has been twisted or of a shape no page could have
+  reset() { this.q = null; this.v = null; this.src = ""; this.miss = 0; this.weak = 0; this.boost = 0; this.hist.clear(); this.strong = 0; this.differ = 0; this.cf = -1; this.sideOk = [0, 0, 0, 0]; this.unsure = -1; this.proposal = null; this.lastProp = null; this.follow = null; this.moOk = 0; this.settled = false; this.jumpF = -1; this.aiD = 1; this.aiAt = 0; this.far = 0; this.aiO = 0; this.overlaps = 0; this.agrees = 0; this.shown = false; this.pull = [null, null, null, null]; this.sidePull = null; this.out = [false, false, false, false]; this.lastA = null; this.odd = 0; },
 };
 const ZERO = () => [[0, 0], [0, 0], [0, 0], [0, 0]];
 // How close the AI's outline must be to the tracked one to agree with it (share of the diagonal): an outline
@@ -876,10 +877,11 @@ function track(f, cf) {
       trk.q = to.map((p, i) => [p[0] + a * (F.q[i][0] - p[0]), p[1] + a * (F.q[i][1] - p[1])]);
     } else trk.q = to;
   }
-  // A page that has mostly left the view isn't worth outlining; nor is an outline that has got twisted or into a shape no
-  // page could have (following the AI's answers while a page was turned in the hand, it once stayed so for seconds):
-  // the next answer finds the page afresh.
-  if (insideShare(trk.q) < 0.5 || !convex(trk.q) || (SNAP_SHAPED && !shapedPx(trk.q, 60, 120, 25))) {
+  // A page that has mostly left the view isn't worth outlining; nor is an outline that has stayed twisted, or in a shape no
+  // page could have, for eight frames (following the AI's answers while a page was turned in the hand, it once stayed so
+  // for seconds; a moment of it, as a page curls, is left alone): the next answer finds the page afresh.
+  trk.odd = convex(trk.q) && shapedPx(trk.q, 60, 120, 25) ? 0 : trk.odd + 1;
+  if (insideShare(trk.q) < 0.5 || (DROP_SHAPED && trk.odd >= 8)) {
     if (st.trace && insideShare(trk.q) >= 0.5) st.events.push({ f, dropped: 1 });
     trk.reset(); trk.hist.set(f, null); prune(f); return null;
   }
@@ -1148,6 +1150,7 @@ function widened(T) {
    followed from frame to frame: pageMotion) when the followed outline goes somewhere the page didn't, and goes there
    too only once the followed outline has stayed there for a moment, gliding there. */
 const calm = { q: null, t: null, M: null, hold: false, n: 0, age: 0, on: true };
+let CALM_TOAI = true;
 const CALM_NEAR = 0.012, CALM_HOLD = 2, CALM_MAX = 15, CALM_STEP = 6;   // (share of the diagonal; frames; frames; grey px)
 // T: the outline to show in this frame (grey px), or null; sides: how many of its sides sit on paper edges. Returns
 // the outline to draw (grey px), or null.
@@ -1169,8 +1172,9 @@ function calmView(T, sides = 4) {
   const e = maxApart(pinned(T), pinned(P));
   // (a big change that takes the outline closer to where the AI sees the page is the page being found, or found
   // better: it's shown straight away, gliding quickly; only one away from the AI's page is held)
-  // (only for a big change: the AI's answers on John's pages scatter by a few per cent, and following each was jumpy)
-  const A = aiNow(), toAI = !!A && e >= 3 * near && maxApart(pinned(align(A, T).q), pinned(T)) < maxApart(pinned(align(A, P).q), pinned(P)) - 0.5 * near;
+  // (only for a big change, 6% of the diagonal or more: the AI's answers on John's pages scatter by a few per cent, and
+  // following each was jumpy)
+  const A = aiNow(), toAI = CALM_TOAI && !!A && e >= 5 * near && maxApart(pinned(align(A, T).q), pinned(T)) < maxApart(pinned(align(A, P).q), pinned(P)) - 0.5 * near;
   if (M && !toAI && maxApart(pinned(T), pinned(moveBy(M, Tp))) >= near) { if (!calm.hold) calm.age = 0; calm.hold = true; calm.n = 0; }
   else if (calm.hold) calm.n++;
   if (calm.hold && (e < near || calm.n >= CALM_HOLD || ++calm.age > CALM_MAX)) calm.hold = false;
@@ -1218,7 +1222,7 @@ function onAIResult(e) {
 // with a very sharp or very blunt corner, or opposite sides far from parallel. A page seen from a phone held over it,
 // even tilted, keeps its corners between 60 and 120 degrees and its opposite sides within 25 degrees of parallel (the
 // AI's answers, with corners beyond the view pinned to its edge, are allowed 50 to 130, and 30).
-let SHAPED = false, SHOW_SHAPED = true, SNAP_SHAPED = true, OUT_PULL = true;
+let SHAPED = false, SHOW_SHAPED = true, SNAP_SHAPED = true, DROP_SHAPED = true, OUT_PULL = false;
 const pinnedNorm = (q) => q.map(([x, y]) => [Math.min(1, Math.max(0, x)), Math.min(1, Math.max(0, y))]);
 function pageShaped(q) { return shapedPx(q.map(([x, y]) => [x * gw, y * gh])); }
 // (lo, hi: the corners' limits in degrees; par: opposite sides' limit off parallel. The AI's answers have corners beyond
@@ -1528,7 +1532,9 @@ self.onmessage = (e) => {
     if (m.over) { OVER_SAME = m.over[0]; OVER_FAR = m.over[1]; }
     if (m.band !== undefined) BAND = !!m.band;
     if (m.snapShaped !== undefined) SNAP_SHAPED = !!m.snapShaped;
+    if (m.dropShaped !== undefined) DROP_SHAPED = !!m.dropShaped;
     if (m.outPull !== undefined) OUT_PULL = !!m.outPull;
     if (m.widen !== undefined) WIDEN = +m.widen;
+    if (m.toAI !== undefined) CALM_TOAI = !!m.toAI;
   }
 };
