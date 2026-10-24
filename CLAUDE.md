@@ -36,29 +36,32 @@ Follow the release checklist in `dev/README.md`: replay suite against the releas
 `Audit Scan x.y.z: <what John will notice>`, push to `main`, check the Pages build. Then tell John to open the app and
 tap **Update now**.
 
-## Where things stand (1.3.3, 24 October 2026)
+## Where things stand (1.3.3 released; branch `phone-tuning` not released, 24 October 2026)
 
 - John's feedback up to 1.3.2: the live outline was "not calm and stable" and "still not very nice", on stacks of
-  stapled A4 pages on a patterned bedsheet, phone held close. 1.3.3 hasn't been tried by him yet at the time of
-  writing: ask him what the footer says for the camera (expected "Camera: 3264×2448") and for a screen recording.
-- 1.3.3: 4:3 camera; the outline shows only when the AI agrees with it, and fades in and out; on a stack it keeps to
-  the top page; a page that overflows the view is outlined up to the view's edge with "Move back to fit the whole
-  page"; the crop is the outline shown. Known limits and the numbers at release: `dev/scenarios.md`.
+  stapled A4 pages (a hand on them, phone held close). His reference is CamScanner (on his phone): no outline while the
+  phone moves, a filled outline ~0.7 s after holding still, then it barely moves; clamped to the view for a page that
+  overflows it; a generous crop (it took his thumb in rather than cutting the page).
+- 24 Oct: tested on his real phone (Honor 90, Chrome 155, camera 2448×3264 portrait at ~27 fps; see "Testing on John's
+  phone" below), seven recorded sessions. Found: his installed 1.3.3 was stuck in "video view" (outline drawn over the
+  live video, trailing it) because the first seconds after the camera opens were slow; the AI is often badly off on his
+  pages (7–40% of its answers are impossible shapes), so 1.3.3 shows the outline only 10–30% of the time ("page not
+  found" while pointing at the page); outlines snapped to folds, printed lines and the hand holding a curled booklet,
+  or got twisted, and crops cut strips off; the capture's second looks picked half pages.
+- Branch `phone-tuning` (all dev-tested, not released): video view no longer sticks, quick start, frames handed over one
+  ahead, faster blur; calm outline on screen; shape checks (no twisted or impossible outlines); outline shown when the
+  AI's page covers the same area; pulls outward to the AI's side; crop widened where the AI sees more page; cut second
+  looks handicapped. Replay suite: the outline followed is better than 1.3.3 in every condition, the outline shown about
+  as good (better clean). On his recordings the outline is shown 2–3× as often.
+- John's verdict on the branch (test copy): still weaker than CamScanner, which "knows what area I need". The limit is
+  the AI page finder (DocCornerNet lean, 224 px): every rule around it second-guesses a weak answer. Next: a stronger
+  on-device page finder (a better corner model, or page segmentation), judged offline on his recordings first.
+- Per-frame cost on his phone ~30 ms (drawing the view 23%, shrinking the frame 35%, copying 10%; tracking 4%).
 
-## Next: test on John's real phone
+## Testing on John's phone
 
-Everything so far was tuned on synthetic videos and two screen recordings, and the gap between those and his real
-pages is the main reason results have disappointed him. With Claude Code on his Windows PC and the phone on USB:
-
-1. Phone: Settings → About phone → tap Build number seven times; then in Developer options turn on USB debugging,
-   plug the phone in and allow the PC when asked. He can turn USB debugging off afterwards.
-2. PC: Android platform-tools (`winget install Google.PlatformTools`); `adb devices` should list the phone.
-3. `adb forward tcp:9222 localabstract:chrome_devtools_remote`, then http://localhost:9222/json lists the pages open
-   in Chrome on the phone (the installed app included), and Playwright's `chromium.connect_over_cdp("http://localhost:9222")`
-   can drive them. `adb shell screenrecord` or scrcpy shows what he sees.
-4. On the camera screen, `window.__auditScan.debugSlow(0, 0, true)` turns on the live worker's per-frame trace in
-   `window.__auditScan.tracker.trace` (outline shown `q`, outline followed `tq`, frames each side has sat on an edge
-   `ok`, the AI's answers and other events `ev`, the frame's timestamp `ts`).
-5. Worth building first: a debug switch that has the live worker also post its 640 px grey frame (and the AI's
-   224 px input) with each traced frame, so a session of John scanning his own stacks can be saved to `dev/videos/`
-   (ignored by git) and replayed with `replay.js`: real-scene tests to check every change against.
+USB debugging is on and this PC is allowed ("Always allow"). Recording and replaying real sessions:
+`dev/README.md`, "John's phone". The test copy is served from this PC at http://localhost:8000/ in Chrome on the phone
+(its own storage, separate from the installed app); recordings stay in `dev/videos/rec_*` (gitignored). USB dropped a
+couple of times when the cable moved: `adb devices` then shows "unauthorized" or "offline"; re-plugging and allowing
+on the phone fixes it, and the adb forward/reverse must be set again (`phone.py connect`).

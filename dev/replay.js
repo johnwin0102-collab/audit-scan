@@ -5,7 +5,7 @@
 //   --ai-bias B --ai-noise N --ai-outlier O: a less exact AI; --drop P --seed S, --step K, --stalls f+n: a slower phone
 //   --shown: score the outline shown (after the "sure enough to show" rule) instead of the one followed
 //   --margin M: count frames as page-in-view only when every corner is M inside; --trace a-b: tracker internals
-//   --pick/--switch/--agree/--no-gate/--inner/--flat: worker test settings (see the debug message in live-worker.js)
+//   --pick/--switch/--agree/--no-gate/--inner/--flat/--over/--no-calm/--no-show-shaped: worker test settings (see the debug message in live-worker.js)
 //   PULLS=1 in the environment prints when a side is pulled onto the edge the AI points at
 "use strict";
 const fs = require("fs"), vm = require("vm"), path = require("path");
@@ -85,6 +85,13 @@ if (opt("--agree", "")) dbg.agree = opt("--agree", "").split(",").map(Number);
 if (args.includes("--no-gate")) dbg.gate = false;
 if (opt("--inner", "")) dbg.inner = opt("--inner", "").split(",").map(Number);
 if (opt("--flat", "")) dbg.flat = +opt("--flat", "");
+if (opt("--over", "")) dbg.over = opt("--over", "").split(",").map(Number);
+if (args.includes("--no-calm")) dbg.calm = false;
+if (args.includes("--no-band")) dbg.band = false;
+if (args.includes("--no-snap-shaped")) dbg.snapShaped = false;
+if (args.includes("--no-out-pull")) dbg.outPull = false;
+if (opt("--widen", "")) dbg.widen = +opt("--widen", "");
+if (args.includes("--no-show-shaped")) dbg.showShaped = false;
 ctx.self.onmessage({ data: dbg });
 
 function fakeFrame(i) {
@@ -132,7 +139,7 @@ function qerr(s, g) {
     if (m && !SHOWN && m.trace && "tq" in m.trace) m = { ...m, quad: m.trace.tq };
     if (i >= ta && i <= tb) console.log(`[${i}] sides ${m && m.sides} ok ${vm.runInContext("trk.sideOk.join(',')", ctx)} err ${m && m.quad ? qerr(m.quad, GT[i].q).toFixed(2) : "-"}`);
     const g = GT[i], inview = g.q.every(([x, y]) => x >= MARGIN && x <= 1 - MARGIN && y >= MARGIN && y <= 1 - MARGIN);
-    rows.push({ f: i, phase: g.phase, inview, vis: g.vis === undefined ? (inview ? 1 : 0.5) : g.vis, q: m && m.quad, err: m && m.quad ? qerr(m.quad, g.q) : null, sides: m ? m.sides : 0, src: m ? m.src : "", done: true, jump: !!(m && m.jump) });
+    rows.push({ calm: ctx.self.__calm, f: i, phase: g.phase, inview, vis: g.vis === undefined ? (inview ? 1 : 0.5) : g.vis, q: m && m.quad, err: m && m.quad ? qerr(m.quad, g.q) : null, sides: m ? m.sides : 0, src: m ? m.src : "", done: true, jump: !!(m && m.jump) });
   }
   const sum = {};
   for (const ph of ["still", "move"]) {

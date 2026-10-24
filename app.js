@@ -262,6 +262,8 @@
     view: "",          // "sent": the preview canvas has been handed to the worker
     noSync: !!window.__auditScanNoSync,   // the worker doesn't draw the view on this phone (tests can ask for that too)
     syncFails: 0,      // times the drawn view stopped and the video was shown instead
+    flight: [],        // VideoFrames sent and not yet answered: { seq, cf, at } (see sendFrame)
+    slowAt: 0, slowTries: 0,   // when the drawn view was last too slow and the video shown instead; times, since the camera started
   };
   function startTracker() {
     if (tracker.worker || tracker.state === "failed") return;
@@ -271,7 +273,7 @@
     tracker.worker.onerror = (e) => {
       e.preventDefault();
       console.error("The live outline stopped", e.message || e);
-      tracker.state = "failed"; tracker.busy = false; tracker.src = "";
+      tracker.state = "failed"; tracker.busy = false; tracker.src = ""; tracker.flight = [];
       cam.synced = false; showSynced(false);
     };
     tracker.state = "ready";
@@ -315,7 +317,10 @@
     return { resizeWidth: Math.max(16, Math.round(vw * k)), resizeHeight: Math.max(16, Math.round(vh * k)), resizeQuality: "medium" };
   }
   function sendFrame(v) {
-    if (tracker.busy || live.frame === tracker.sentFrame) return;
+    if (live.frame === tracker.sentFrame) return;
+    // (VideoFrames go one ahead: the next camera frame is sent before the answer about the last one is back, so the
+    // worker goes straight on to it instead of waiting for the page, and keeps up with about every camera frame)
+    if (tracker.busy && !(tracker.path === "frame" && tracker.flight.length === 1)) return;
     if (!tracker.path) { checkFramePath(v); if (tracker.busy) return; }
     const seq = ++tracker.seq;
     if (tracker.path === "frame") {
@@ -323,8 +328,12 @@
       try { f = new VideoFrame(v); }
       catch (_) { if (++tracker.vfFails >= 3) tracker.path = "canvas"; return; }
       tracker.busy = true; tracker.sentFrame = live.frame; tracker.sentAt = performance.now();
+      tracker.flight.push({ seq, cf: live.frame, at: tracker.sentAt });
       try { tracker.worker.postMessage({ type: "frame", seq, cf: live.frame, epoch: tracker.epoch, frame: f }, [f]); }
-      catch (_) { try { f.close(); } catch (_e) { /* gone */ } tracker.busy = false; tracker.path = "canvas"; }
+      catch (_) {
+        try { f.close(); } catch (_e) { /* gone */ }
+        tracker.flight.pop(); tracker.busy = tracker.flight.length > 0; tracker.path = "canvas";
+      }
       return;
     }
     // Drawing frames costs the page time: on a phone where it's slow, draw fewer of them.
@@ -360,7 +369,10 @@
       return;
     }
     if (m.type !== "quad") return;
-    tracker.busy = false;
+    // (the frame this answers: the oldest of those sent ahead, or the only one sent)
+    const sent = tracker.flight.find((x) => x.seq === m.seq);
+    tracker.flight = tracker.flight.filter((x) => x.seq > m.seq);
+    tracker.busy = tracker.flight.length > 0;
     // This phone's frames can't be read in the worker: stills of the video instead, and if even those can't,
     // the page draws each frame small itself (and the video shows the camera).
     if (m.fallback) { if (tracker.path === "canvas") noSync(); tracker.path = "canvas"; }
@@ -372,13 +384,15 @@
       if (m.stats.aiMs) stats.mlMs = m.stats.aiMs;
       if (m.stats.way) stats.way = m.stats.way;
     }
-    stats.rtMs = ema(stats.rtMs, performance.now() - tracker.sentAt);
+    stats.rtMs = ema(stats.rtMs, performance.now() - (sent ? sent.at : tracker.sentAt));
     tracker.src = m.src || "";
     cam.sides = m.sides || 0;
     cam.cut = !!m.cut;
-    if (m.trace && tracker.trace) tracker.trace.push({ seq: m.seq, cf: tracker.sentFrame, t: performance.now(), q: m.quad, ...m.trace });
+    cam.crop = m.crop || null;
+    const f = sent ? sent.cf : tracker.sentFrame;
+    if (m.trace && tracker.trace) tracker.trace.push({ seq: m.seq, cf: f, t: performance.now(), q: m.quad, ...m.trace });
     // How fast the outline moves (per camera frame), to place it on frames shown before its next update.
-    const f = tracker.sentFrame, q = m.quad, p = cam.motion;
+    const q = m.quad, p = cam.motion;
     // (not across a jump to a new outline, and never faster than a hand moves a phone)
     if (q && p.q && !m.jump && f > p.f && f - p.f <= 3 && maxDelta(q, p.q) < 0.08) {
       const k = 1 / (f - p.f);
@@ -426,17 +440,22 @@
     drawQuad(on ? null : cam.shown, cam.showSteady);
   }
   function noSync() { tracker.noSync = true; syncView(false); }
-  // After the drawn view stalled (the phone was busy, say) and the video was shown instead: back to the
-  // drawn view once the outline keeps up with the camera again.
+  // The drawn view can't keep up with the camera just now: the video is shown instead, and the drawn view is tried
+  // again once the outline keeps up (resync), up to three times while the camera is on, and again each time the
+  // camera starts. (It used to be given up for good, and a slow moment, like the first seconds while the AI is
+  // loading, left the outline trailing the video for the rest of the day.)
+  function slowView() { tracker.slowAt = performance.now(); tracker.slowTries++; syncView(false); }
+  // After the drawn view stalled (the phone was busy, say) or was too slow, and the video was shown instead: back to
+  // the drawn view once the outline keeps up with the camera again (after slowness, more clearly and for longer).
   function resync() {
-    if (tracker.noSync || !tracker.syncFails || cam.synced || !cam.stream) return;
-    const now = performance.now();
-    cam.okRun = cam.lastAnswer && now - cam.lastAnswer < 70 ? (cam.okRun || 0) + 1 : 0;
+    if (tracker.noSync || (!tracker.syncFails && !tracker.slowAt) || cam.synced || !cam.stream) return;
+    const now = performance.now(), slow = !!tracker.slowAt;
+    cam.okRun = cam.lastAnswer && now - cam.lastAnswer < (slow ? 55 : 70) ? (cam.okRun || 0) + 1 : 0;
     cam.lastAnswer = now;
-    if (cam.okRun >= 20) syncView(true);
+    if (cam.okRun >= (slow ? 40 : 20) && (!slow || (tracker.slowTries < 3 && now - tracker.slowAt > 3000 && cam.inFlight === 0))) syncView(true);
   }
   // Called every screen refresh while the worker draws the view: if its drawing stops, the video is shown
-  // instead; if it can't keep up with the camera at all on this phone, the video is shown from then on.
+  // instead; if it can't keep up with the camera, the video is shown until it can (slowView).
   function watchSync(now) {
     if (!cam.stream || S.screen !== "camera" || document.hidden) { cam.syncAt = now; return; }
     if (now - Math.max(cam.drawnAt, cam.syncAt) > (cam.drawnAt ? 700 : 2500)) {
@@ -448,10 +467,12 @@
     const s = (now - w.at) / 1000, drawn = cam.drawN / s, camHz = (live.frame - w.frame) / s;
     // Too slow: fewer than half the camera's frames get drawn (and under 15 a second), or frames come far slower
     // than the camera is set to give them (the hidden video may be held back on some phones). Not while pages
-    // are being processed: that takes cores for a moment.
-    w.slow = drawn < Math.min(15, 0.5 * camHz) || (drawn < 12 && cam.fps >= 24 && camHz < 12) ? (cam.inFlight === 0 ? w.slow + 1 : w.slow) : 0;
+    // are being processed (that takes cores for a moment), nor in the first seconds after the camera starts (the
+    // AI, the image engine and the outline's own checks are still getting going).
+    const busy = cam.inFlight > 0 || now - cam.startedAt < 6000;
+    w.slow = drawn < Math.min(15, 0.5 * camHz) || (drawn < 12 && cam.fps >= 24 && camHz < 12) ? (busy ? w.slow : w.slow + 1) : 0;
     w.at = now; w.frame = live.frame; cam.drawN = 0;
-    if (w.slow >= 2) noSync();
+    if (w.slow >= 2) slowView();
   }
   const viewDpr = () => Math.min(window.devicePixelRatio || 1, 2.5);
   function sizeView() {
@@ -746,7 +767,9 @@
     // worker last drew a frame, frames drawn since rate.at, answers in a row that kept up with the camera
     synced: false, viewing: false, viewW: 0, viewH: 0, syncAt: 0, drawnAt: 0, drawN: 0, rate: { at: 0, frame: 0, slow: 0 }, okRun: 0, lastAnswer: 0,
     fps: 0,   // frames a second the camera is set to give
+    startedAt: 0,   // when the camera last started
     cut: false,   // the outline isn't shown because part of the page is out of view
+    crop: null,   // the crop for a capture now, from the live outline worker (see live-worker.js widened)
   };
   // Live page finding: every new camera frame goes to the live outline worker (or, if that worker isn't
   // running, the AI finder looks at every frame it can keep up with); the classical edge finder runs
@@ -797,6 +820,9 @@
       trackFeatures();
       requestWakeLock();
       resetDetection();
+      // (the drawn view gets another chance each time the camera starts, if it was only too slow before)
+      cam.startedAt = performance.now(); tracker.slowTries = 0;
+      if (tracker.slowAt && !cam.synced) { tracker.slowAt = 0; syncView(true); }
       loopStart();
     } catch (err) {
       const n = err && err.name;
@@ -874,7 +900,7 @@
     cam.lastQuad = null; cam.shown = null; cam.target = null; cam.anchor = null; cam.steadySince = 0; cam.misses = 0; cam.armed = true;
     cam.showSteady = false; cam.lostSince = performance.now(); cam.cut = false;
     live.mlQuad = null; live.cvQuad = null; live.cvAt = 0;
-    tracker.epoch++; tracker.busy = false; tracker.sentFrame = -1; tracker.src = "";
+    tracker.epoch++; tracker.busy = false; tracker.sentFrame = -1; tracker.src = ""; tracker.flight = [];
     cam.motion = { q: null, f: -1, v: null };
     cam.syncAt = performance.now(); cam.drawnAt = 0; cam.drawN = 0; cam.rate = { at: cam.syncAt, frame: live.frame, slow: 0 };
     if (tracker.worker) tracker.worker.postMessage({ type: "reset" });
@@ -931,7 +957,7 @@
     const now = performance.now();
     // A frame the worker never answered (it shouldn't happen): try drawn frames, then the old way.
     if (tracker.state === "ready" && tracker.busy && now - tracker.sentAt > 1500) {
-      tracker.busy = false;
+      tracker.busy = false; tracker.flight = [];
       tracker.stalls++;
       if (tracker.stalls >= 2) tracker.path = "canvas";
       if (tracker.stalls >= 4) { tracker.state = "failed"; tracker.src = ""; noSync(); }
@@ -1148,7 +1174,8 @@
     if (!cam.stream || !S.batch || cam.inFlight >= MAX_IN_FLIGHT) return;
     const now = performance.now();
     // the outline on screen as the shutter went (none if it's gone or stale: the crop then comes from the photo alone)
-    const seen = cam.shown || cam.lastQuad;
+    // (the live outline worker's crop: the outline shown, widened where the AI sees more of the page)
+    const seen = cam.crop || cam.shown || cam.lastQuad;
     const previewQuad = seen && cam.lastQuad && now - cam.lastQuadAt < 200 ? seen.map(([x, y]) => [clamp(x, 0, 1), clamp(y, 0, 1)]) : null;
     cam.armed = false;
     cam.capturedAt = now;

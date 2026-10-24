@@ -23,25 +23,24 @@ function sizeGrey(w, h) {
     blurTmp = new Float32Array(gw * gh);
     mo.prev = null;
     trk.reset();
+    calm.q = null;
   }
 }
 
-// 3 x 3 box blur in place (two passes)
+// 3 x 3 box blur in place (sums of three along each row, then of three rows; the edges count twice)
 function blur3(g, w, h) {
-  const t = blurTmp;
+  const t = blurTmp, n = 1 / 9;
   for (let y = 0; y < h; y++) {
-    const o = y * w;
-    t[o] = (g[o] * 2 + g[o + 1]) / 3;
-    for (let x = 1; x < w - 1; x++) t[o + x] = (g[o + x - 1] + g[o + x] + g[o + x + 1]) / 3;
-    t[o + w - 1] = (g[o + w - 2] + g[o + w - 1] * 2) / 3;
+    const o = y * w, e = o + w - 1;
+    let a = g[o], b = g[o], c = g[o + 1];
+    t[o] = a + b + c;
+    for (let i = o + 1; i < e; i++) { a = b; b = c; c = g[i + 1]; t[i] = a + b + c; }
+    t[e] = b + c + c;
   }
-  for (let x = 0; x < w; x++) g[x] = (t[x] * 2 + t[x + w]) / 3;
-  for (let y = 1; y < h - 1; y++) {
-    const o = y * w;
-    for (let x = 0; x < w; x++) g[o + x] = (t[o + x - w] + t[o + x] + t[o + x + w]) / 3;
-  }
-  const o = (h - 1) * w;
-  for (let x = 0; x < w; x++) g[o + x] = (t[o + x - w] + t[o + x] * 2) / 3;
+  const last = (h - 1) * w;
+  for (let x = 0; x < w; x++) g[x] = (t[x] * 2 + t[x + w]) * n;
+  for (let i = w; i < last; i++) g[i] = (t[i - w] + t[i] + t[i + w]) * n;
+  for (let i = last; i < last + w; i++) g[i] = (t[i - w] + t[i] * 2) * n;
 }
 
 // Where to sample the copied frame (vw x vh): two points per grey pixel each way, a quarter and three
@@ -208,6 +207,17 @@ function fromRGBA(px, w, h, wantAI, k = 1) {
   return out;
 }
 
+// (tests) A recorded grey picture, already blurred (see rec), and the AI picture recorded with it (RGB), if any.
+function fromGrey(g, w, h, rgb) {
+  sizeGrey(w, h);
+  if (w !== gw || h !== gh) throw new Error("Unexpected picture size");
+  for (let i = 0; i < g.length; i++) grey[i] = g[i];
+  if (!rgb) return null;
+  const out = new Uint8ClampedArray(AI * AI * 4);
+  for (let i = 0, j = 0; i < out.length; i += 4, j += 3) { out[i] = rgb[j]; out[i + 1] = rgb[j + 1]; out[i + 2] = rgb[j + 2]; out[i + 3] = 255; }
+  return out;
+}
+
 // 24 x 24 brightness sketch of the frame, used by the page to notice a page being turned.
 function signature() {
   const out = new Uint8Array(576);
@@ -229,7 +239,9 @@ function signature() {
    3 px clear of the edge) that a thin printed line or table rule can't fake. The points found are fitted with
    a straight line, robustly, so text and shadows that fool a few points don't move it. */
 const K = 20, NA = 2, WG = 3, WB = 8, MM = WG + WB, T_STEP = 7, INL = 1.6, RMAX = 28;
-const prof = new Float64Array(2 * (RMAX + MM) + 2);
+// (the profile also runs EXT px further out, to see what's beyond an edge: see bandBeyond)
+const EXT = 56;
+const prof = new Float64Array(2 * (RMAX + MM) + 2 + EXT);
 const cum = new Float64Array(prof.length + 1), cum2 = new Float64Array(prof.length + 1);
 // A paper edge has blank paper on its inside: the profile there is flat. A block of text or a printed box (the
 // column's edge looks like a step at the wide scale) isn't, so a candidate whose inside varies more than this
@@ -321,7 +333,7 @@ function fitLine(sign, out) {
 // "outer" takes the outermost edge nearly as strong as the strongest.
 // settled: the side has sat on its edge for a while, so the pick keeps sharply to where it's expected (the reach
 // R still grows with the motion, but another edge within it has to be much the stronger to take the side).
-function snapSide(P0x, P0y, P1x, P1y, cx, cy, R, pick = PICK, settled = false) {
+function snapSide(P0x, P0y, P1x, P1y, cx, cy, R, pick = PICK, settled = false, band = false) {
   const sig = settled ? 3 : Math.max(3, R / 2.5), inw = Math.min(R, INNER_R * Math.hypot(gw, gh));
   const dx = P1x - P0x, dy = P1y - P0y, L = Math.hypot(dx, dy) || 1e-9;
   let nx = -dy / L, ny = dx / L;
@@ -330,7 +342,7 @@ function snapSide(P0x, P0y, P1x, P1y, cx, cy, R, pick = PICK, settled = false) {
   for (let k = 0; k < K; k++) {
     const px = P0x + tk[k] * dx, py = P0y + tk[k] * dy;
     cum[0] = 0; cum2[0] = 0;
-    for (let j = 0; j < S; j++) {
+    for (let j = 0; j < S + EXT; j++) {
       const s = j - R - MM, x = px + s * nx, y = py + s * ny;
       const inside = x >= 0 && y >= 0 && x <= gw - 1.001 && y <= gh - 1.001;
       okv[j] = inside ? 1 : 0;
@@ -338,9 +350,10 @@ function snapSide(P0x, P0y, P1x, P1y, cx, cy, R, pick = PICK, settled = false) {
       cum[j + 1] = cum[j] + v; cum2[j + 1] = cum2[j] + v * v;
     }
     // the part of the profile inside the frame (one stretch, as the frame is convex)
-    let lo = 0, hi = S - 1;
+    let lo = 0, hi = S - 1, hiX = S + EXT - 1;
     while (lo < S && !okv[lo]) lo++;
     while (hi >= 0 && !okv[hi]) hi--;
+    while (hiX >= 0 && !okv[hiX]) hiX--;
     let best0 = -1e9, best1 = -1e9, j0 = -1, j1 = -1;
     const r0 = resp[0], r1 = resp[1];
     for (let j = MM; j <= MM + 2 * R; j++) {
@@ -353,7 +366,9 @@ function snapSide(P0x, P0y, P1x, P1y, cx, cy, R, pick = PICK, settled = false) {
       const sI = cum[j - WG + 1] - cum[j - MM], mI = sI / (WB + 1);
       if ((cum2[j - WG + 1] - cum2[j - MM]) / (WB + 1) - mI * mI > FLAT_IN * FLAT_IN) continue;   // not blank paper inside
       const rw = mI - (cum[e + 1] - cum[j + WG]) / (e - (j + WG) + 1);
-      const p = rn < rw ? rn : rw, q = -rn < -rw ? -rn : -rw;
+      let p = rn < rw ? rn : rw;
+      const q = -rn < -rw ? -rn : -rw;
+      if (p > T_STEP && band && bandBeyond(j, mI, hiX)) p = -1e9;
       r0[j] = p; r1[j] = q;
       if (p > best0) { best0 = p; j0 = j; }
       if (q > best1) { best1 = q; j1 = j; }
@@ -421,6 +436,25 @@ function snapSide(P0x, P0y, P1x, P1y, cx, cy, R, pick = PICK, settled = false) {
   };
 }
 
+// Is there paper beyond the edge at j (profile index, see snapSide) as well as inside it? A finger or a hand holding the
+// page, or a dark band printed on it (the banner under a letterhead, a black block), is dark for a stretch beyond its
+// edge (8 px or more, under EXT) and then there's flat paper again, about as bright as inside (mI). To the edge test it
+// looks just like the paper's edge, so the outline (and the crop) stopped at John's finger. The edge of a sheet under
+// the page has only a thin shadow line before the paper beyond.
+let BAND = true;
+function bandBeyond(j, mI, hiX) {
+  // the dark stretch: 4 px windows all well darker than the paper inside, from 2 px beyond the edge, at least 8 px wide
+  let t = j + 2;
+  while (t + 4 <= hiX + 1 && t <= j + EXT - 14 && (cum[t + 4] - cum[t]) / 4 < mI - 25) t += 2;
+  if (t - (j + 2) < 8) return false;
+  // then, within a few px, 10 px of flat paper about as bright as inside
+  for (let u = t; u <= t + 4 && u + 10 <= hiX + 1; u += 2) {
+    const m = (cum[u + 10] - cum[u]) / 10;
+    if (Math.abs(m - mI) <= 12 && (cum2[u + 10] - cum2[u]) / 10 - m * m <= FLAT_IN * FLAT_IN) return true;
+  }
+  return false;
+}
+
 function intersect(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1) {
   const d1x = ax1 - ax0, d1y = ay1 - ay0, d2x = bx1 - bx0, d2y = by1 - by0;
   const den = d1x * d2y - d1y * d2x;
@@ -481,13 +515,13 @@ function onPrintedLine(Q, i) {
 // score: how well the outline sits on paper edges (0 to 4: each side's share on an edge, weighed by how
 // clear the edge is).
 const NONE = { sides: 0, ok: [false, false, false, false], score: 0 };
-function snapQuad(Q, R, pick = PICK, settled = null) {
+function snapQuad(Q, R, pick = PICK, settled = null, band = null) {
   const cx = (Q[0][0] + Q[1][0] + Q[2][0] + Q[3][0]) / 4, cy = (Q[0][1] + Q[1][1] + Q[2][1] + Q[3][1]) / 4;
   const lines = [], ok = [false, false, false, false];
   let sides = 0, score = 0;
   for (let i = 0; i < 4; i++) {
     const a = Q[i], b = Q[(i + 1) % 4];
-    const s = onBorder(a, b) ? null : snapSide(a[0], a[1], b[0], b[1], cx, cy, R, pick, !!(settled && settled[i]));
+    const s = onBorder(a, b) ? null : snapSide(a[0], a[1], b[0], b[1], cx, cy, R, pick, !!(settled && settled[i]), !!(band && band[i]));
     if (s) { sides++; ok[i] = true; lines.push(s.l); score += s.frac * Math.min(1, s.str / 30); }
     else lines.push([a[0], a[1], b[0], b[1], b[0] - a[0], b[1] - a[1], b[0] - a[0], b[1] - a[1]]);
   }
@@ -500,7 +534,9 @@ function snapQuad(Q, R, pick = PICK, settled = null) {
     if (!p || Math.abs(p[0] - Q[i][0]) > lim || Math.abs(p[1] - Q[i][1]) > lim) return { q: Q, ...NONE };
     out.push(p);
   }
-  if (!convex(out) || area(out) < 0.03 * gw * gh) return { q: Q, ...NONE };
+  // (nor one no page could look like: a side gone over to the edge of a hand holding the page can swing a corner far
+  // across it, and the outline, and the crop, then stopped at the hand)
+  if (!convex(out) || area(out) < 0.03 * gw * gh || (SNAP_SHAPED && !shapedPx(out, 60, 120, 25))) return { q: Q, ...NONE };
   return { q: out, sides, ok, score };
 }
 
@@ -515,18 +551,23 @@ const trk = {
   sideOk: [0, 0, 0, 0],      // frames in a row each side has sat on an edge
   cfOf: new Map(),           // worker frame number -> camera frame number
   unsure: -1,                // last frame before which a stall happened, until the AI confirms the outline
-  aiD: 1, aiAt: 0, far: 0,   // the AI's last answer: how far its page was from the outline (share of the diagonal),
+  aiD: 1, aiAt: 0, far: 0, aiO: 0, overlaps: 0,   // the AI's last answer: how far its page was from the outline (share of the diagonal),
                              // when it came, and how many answers running have put the page well away (see noteAI)
   agrees: 0,                 // the AI's answers that have agreed with the outline since it was put where it is
   shown: false, cut: false,  // the outline was shown on the last frame; it wasn't, as part of the page was out of view
   pull: [null, null, null, null], sidePull: null,   // per side: the AI's answers running that put the side a little inward (see notePulls)
-  reset() { this.q = null; this.v = null; this.src = ""; this.miss = 0; this.weak = 0; this.boost = 0; this.hist.clear(); this.strong = 0; this.differ = 0; this.cf = -1; this.sideOk = [0, 0, 0, 0]; this.unsure = -1; this.proposal = null; this.lastProp = null; this.follow = null; this.moOk = 0; this.settled = false; this.jumpF = -1; this.aiD = 1; this.aiAt = 0; this.far = 0; this.agrees = 0; this.shown = false; this.pull = [null, null, null, null]; this.sidePull = null; },
+  out: [false, false, false, false],   // per side: the AI's last answer put it well further out (see notePulls, bandBeyond)
+  lastA: null,               // the AI's last answer that could be a page (grey px), with the outline then (see widened)
+  reset() { this.q = null; this.v = null; this.src = ""; this.miss = 0; this.weak = 0; this.boost = 0; this.hist.clear(); this.strong = 0; this.differ = 0; this.cf = -1; this.sideOk = [0, 0, 0, 0]; this.unsure = -1; this.proposal = null; this.lastProp = null; this.follow = null; this.moOk = 0; this.settled = false; this.jumpF = -1; this.aiD = 1; this.aiAt = 0; this.far = 0; this.aiO = 0; this.overlaps = 0; this.agrees = 0; this.shown = false; this.pull = [null, null, null, null]; this.sidePull = null; this.out = [false, false, false, false]; this.lastA = null; },
 };
 const ZERO = () => [[0, 0], [0, 0], [0, 0], [0, 0]];
 // How close the AI's outline must be to the tracked one to agree with it (share of the diagonal): an outline
 // with all four sides on edges is given a little more room. Further off, the AI's outline is tried against
 // the edges (see track: a proposal).
 let AGREE_FIRM = 0.025, AGREE = 0.012;
+// For showing the outline (confirmed): the AI's page and the outline cover about the same part of the view (overlap at
+// least OVER_SAME), or clearly not (under OVER_FAR); see noteAI.
+let OVER_SAME = 0.85, OVER_FAR = 0.75;
 const toPx = (q) => q.map(([x, y]) => [x * gw, y * gh]);
 const toNorm = (q) => q.map(([x, y]) => [x / gw, y / gh]);
 
@@ -569,6 +610,21 @@ function notePulls(Aq, T) {
     if (((a[0] + b[0]) / 2 - cx) * nx + ((a[1] + b[1]) / 2 - cy) * ny < 0) { nx = -nx; ny = -ny; }   // outward
     let o0 = (Aq[i][0] - a[0]) * nx + (Aq[i][1] - a[1]) * ny, o1 = (Aq[(i + 1) % 4][0] - b[0]) * nx + (Aq[(i + 1) % 4][1] - b[1]) * ny;
     // (a side on no edge may be pulled outward: the test below is written for inward pulls, so flip the signs)
+    // (the AI puts the side well further out, on average, and not inward at either end: see bandBeyond)
+    trk.out[i] = o0 + o1 > 16 && Math.min(o0, o1) > 0 && Math.max(o0, o1) < EXT + 12;
+    // The AI puts the side well further out at both ends: further than sheets under a page peek out (so the page's own
+    // edge isn't given up for theirs), and within reach. The side is on a fold, a printed line or the edge of a hand
+    // holding the page, inside the page: on John's stapled booklets the crop was cut there. Twice running, the side
+    // goes out to where the AI puts it (see track).
+    const diag = Math.hypot(gw, gh);
+    if (OUT_PULL && o0 >= 0.025 * diag && o1 >= 0.025 * diag && o0 + o1 >= 0.08 * diag && Math.max(o0, o1) <= 0.15 * diag) {
+      const P = trk.pull[i];
+      const same = P && P.out && Math.abs(P.o0 - o0) < 0.3 * o0 + 8 && Math.abs(P.o1 - o1) < 0.3 * o1 + 8;
+      trk.pull[i] = same ? { n: P.n + 1, o0: (P.o0 + o0) / 2, o1: (P.o1 + o1) / 2, out: true } : { n: 1, o0, o1, out: true };
+      const size = (o0 + o1) / 2;
+      if (trk.pull[i].n >= 2 && (!best || size > best.size)) best = { i, o0: trk.pull[i].o0, o1: trk.pull[i].o1, size, out: true };
+      continue;
+    }
     const sg = trk.sideOk[i] === 0 && o0 > 0 && o1 > 0 ? -1 : 1;
     o0 *= sg; o1 *= sg;
     // inward at both ends (by different amounts when the sheet underneath lies askew), clearly so at one end (more
@@ -577,19 +633,26 @@ function notePulls(Aq, T) {
     o0 *= sg; o1 *= sg;
     const P = trk.pull[i];
     const same = P && Math.abs(P.o0 - o0) < 0.5 * Math.abs(o0) + 6 && Math.abs(P.o1 - o1) < 0.5 * Math.abs(o1) + 6;
-    trk.pull[i] = same ? { n: P.n + 1, o0: (P.o0 + o0) / 2, o1: (P.o1 + o1) / 2 } : { n: 1, o0, o1 };
+    trk.pull[i] = same && !P.out ? { n: P.n + 1, o0: (P.o0 + o0) / 2, o1: (P.o1 + o1) / 2 } : { n: 1, o0, o1 };
     const size = Math.abs(o0 + o1) / 2;
     if (trk.pull[i].n >= 2 && (!best || size > best.size)) best = { i, o0: trk.pull[i].o0, o1: trk.pull[i].o1, size };
   }
   if (best) trk.sidePull = best;
 }
 
-// What the AI's answer says of the outline (d: how far apart, share of the diagonal). "Well away" is further than
-// the AI is usually off: a little further for an outline that sits on paper edges.
-function noteAI(d, now) {
+// What the AI's answer says of the outline (d: how far apart its corners are, share of the diagonal; o: how much of the
+// view they cover in common, see overlapInView). "Well away" is further than the AI is usually off (a little further
+// for an outline that sits on paper edges) and not over about the same part of the view: on John's pages the AI's
+// corners are often well off (a hand on the page, sheets underneath, a page bigger than the view) while it sees the
+// same page, and the outline was hidden for most of the time it was on the page.
+function noteAI(d, now, o, shaped = true) {
   const edges = trk.sideOk.filter((n) => n >= 3).length >= 3;
-  trk.aiD = d; trk.aiAt = now;
-  trk.far = d > (edges ? 0.05 : 0.035) ? trk.far + 1 : 0;
+  // (an answer no page could look like, see pageShaped, says nothing either way: it neither hides the outline nor keeps
+  // it shown)
+  if (!shaped) return;
+  trk.aiD = d; trk.aiAt = now; trk.aiO = o;
+  trk.far = d > (edges ? 0.05 : 0.035) && o < OVER_FAR ? trk.far + 1 : 0;
+  trk.overlaps = o >= OVER_SAME ? trk.overlaps + 1 : 0;
 }
 
 // A finder's answer about frame f: normalised corners, or null for "no page". src: "ai" or "cv".
@@ -641,7 +704,8 @@ function onFinder(f, quad, src) {
     // the page (on its edges, or agreeing with the AI), only when the answer before was well away too, so one
     // odd answer doesn't throw it off. Either way, the next frame also looks for edges around the AI's outline.
     const F = trk.follow, diag = Math.hypot(gw, gh), d = maxApart(pinned(T), pinned(trk.q));
-    noteAI(d / diag, now);
+    if (pageShaped(quad)) trk.lastA = { q: T.map((p) => p.slice()), ref: trk.q.map((p) => p.slice()), at: now };
+    noteAI(d / diag, now, overlapInView(T, trk.q), pageShaped(quad));
     if (d > 0.025 * diag) {
       if (trk.settled && !(F && F.far)) { trk.follow = { q: F ? F.q : null, far: true }; return; }
       trk.q = T; trk.v = ZERO(); trk.boost = 1; trk.jumped = true; trk.settled = false; trk.jumpF = trk.lastF + 1; trk.moOk = 0;
@@ -658,7 +722,10 @@ function onFinder(f, quad, src) {
     // The AI pins corners outside the view to its edge, so compare with the tracked corners pinned the same way.
     const refC = ref.map(([x, y]) => [Math.min(gw, Math.max(0, x)), Math.min(gh, Math.max(0, y))]);
     const m = align(A, refC);
-    if (src === "ai") { noteAI(m.d / Math.hypot(gw, gh), now); notePulls(m.q, refC); }
+    if (src === "ai") {
+      noteAI(m.d / Math.hypot(gw, gh), now, overlapInView(m.q, ref), pageShaped(quad));
+      if (pageShaped(quad)) { notePulls(m.q, refC); trk.lastA = { q: m.q, ref: ref.map((p) => p.slice()), at: now }; }
+    }
     if (st.trace) st.events.push({ f, src, d: +(m.d / Math.hypot(gw, gh) * 100).toFixed(2), firm: trk.sideOk.every((n) => n >= 3), ok: trk.sideOk.join(",") });
     // An outline with all four sides on edges is trusted further than one with a side that's only a guess.
     const firm = trk.sideOk.every((n) => n >= 3) && !(trk.unsure >= 0 && f <= trk.unsure);
@@ -690,7 +757,7 @@ function onFinder(f, quad, src) {
   trk.src = src; trk.boost = 2; trk.weak = 0; trk.strong = 0; trk.jumped = true; trk.jumpF = trk.lastF + 1; trk.moOk = 0;
   trk.sideOk = [0, 0, 0, 0];
   trk.agrees = src === "ai" ? 1 : 0;
-  if (src === "ai") { trk.agreeAt = now; noteAI(0, now); }
+  if (src === "ai") { trk.agreeAt = now; noteAI(0, now, 1); }
 }
 
 // f: frame number in this worker's sequence; cf: the camera's frame number (frames the page skipped count).
@@ -717,7 +784,8 @@ function track(f, cf) {
   const R = Math.round(Math.min(RMAX, (trk.boost > 0 ? 22 : 12) + vmax * gap));
   if (trk.boost > 0) trk.boost--;
   // (a side that has sat on its edge for a while keeps sharply to it, unless the outline is moving fast)
-  let { q, sides, ok, score } = snapQuad(pred, R, PICK, vmax * gap < 4 ? trk.sideOk.map((n) => n >= 5) : null);
+  // (sides the AI puts well further out: an edge with paper beyond it as well isn't the page's, see bandBeyond)
+  let { q, sides, ok, score } = snapQuad(pred, R, PICK, vmax * gap < 4 ? trk.sideOk.map((n) => n >= 5) : null, BAND ? trk.out : null);
   let jumped = false;
   if (trk.proposal) {
     const P = trk.proposal;
@@ -762,7 +830,7 @@ function track(f, cf) {
   // A side the AI keeps putting a little inside where it sits (the edge of a sheet peeking out from under the page):
   // try it on the edge where the AI puts it, and take that if there's a clear edge there.
   if (trk.sidePull && !jumped && sides >= 2) {
-    const { i, o0, o1 } = trk.sidePull;
+    const { i, o0, o1, out } = trk.sidePull;
     const a = q[i], b = q[(i + 1) % 4], dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy) || 1e-9;
     let nx = -dy / L, ny = dx / L;
     const cx = (q[0][0] + q[1][0] + q[2][0] + q[3][0]) / 4, cy = (q[0][1] + q[1][1] + q[2][1] + q[3][1]) / 4;
@@ -770,7 +838,8 @@ function track(f, cf) {
     const Q2 = q.map((p) => p.slice());
     Q2[i] = [a[0] + o0 * nx, a[1] + o0 * ny]; Q2[(i + 1) % 4] = [b[0] + o1 * nx, b[1] + o1 * ny];
     const alt = snapQuad(Q2, 10);
-    if (alt.ok[i] && alt.sides >= Math.min(3, sides)) {
+    // (a side pulled well out takes the AI's place for it even with no edge there: a curled or covered edge)
+    if ((alt.ok[i] || out) && alt.sides >= Math.min(3, sides) - (out && !alt.ok[i] ? 1 : 0)) {
       ({ q, sides, ok, score } = alt);
       trk.sideOk[i] = 0; trk.boost = 0;
       if (st.trace) st.events.push({ f, pull: i, o0: +o0.toFixed(1), o1: +o1.toFixed(1) });
@@ -807,8 +876,13 @@ function track(f, cf) {
       trk.q = to.map((p, i) => [p[0] + a * (F.q[i][0] - p[0]), p[1] + a * (F.q[i][1] - p[1])]);
     } else trk.q = to;
   }
-  // A page that has mostly left the view isn't worth outlining.
-  if (insideShare(trk.q) < 0.5) { trk.reset(); trk.hist.set(f, null); prune(f); return null; }
+  // A page that has mostly left the view isn't worth outlining; nor is an outline that has got twisted or into a shape no
+  // page could have (following the AI's answers while a page was turned in the hand, it once stayed so for seconds):
+  // the next answer finds the page afresh.
+  if (insideShare(trk.q) < 0.5 || !convex(trk.q) || (SNAP_SHAPED && !shapedPx(trk.q, 60, 120, 25))) {
+    if (st.trace && insideShare(trk.q) >= 0.5) st.events.push({ f, dropped: 1 });
+    trk.reset(); trk.hist.set(f, null); prune(f); return null;
+  }
   trk.hist.set(f, trk.q.map((p) => p.slice()));
   prune(f);
   return { quad: toNorm(trk.q), sides };
@@ -820,6 +894,11 @@ function prune(f) {
 
 // Share of quad q's area inside the convex polygon c (q clipped to c, Sutherland-Hodgman).
 function clipShare(q, c) {
+  const full = area(q);
+  return full > 0 ? polyArea(clipPoly(q, c)) / full : 0;
+}
+// Polygon q clipped to the convex polygon c (Sutherland-Hodgman).
+function clipPoly(q, c) {
   let poly = q.map((p) => p.slice());
   // orientation of c, so "inside" is the same side of every edge
   let o = 0;
@@ -836,14 +915,26 @@ function clipShare(q, c) {
     }
     poly = out;
   }
-  if (poly.length < 3) return 0;
-  let s = 0;
-  for (let i = 0; i < poly.length; i++) { const a = poly[i], b = poly[(i + 1) % poly.length]; s += a[0] * b[1] - b[0] * a[1]; }
-  const full = area(q);
-  return full > 0 ? Math.abs(s) / 2 / full : 0;
+  return poly;
 }
+function polyArea(p) {
+  if (p.length < 3) return 0;
+  let s = 0;
+  for (let i = 0; i < p.length; i++) { const a = p[i], b = p[(i + 1) % p.length]; s += a[0] * b[1] - b[0] * a[1]; }
+  return Math.abs(s) / 2;
+}
+const VIEW = () => [[0, 0], [gw, 0], [gw, gh], [0, gh]];
 // Share of the quad's area inside the frame.
-const insideShare = (q) => clipShare(q, [[0, 0], [gw, 0], [gw, gh], [0, gh]]);
+const insideShare = (q) => clipShare(q, VIEW());
+// How much of the picture two outlines (grey px) cover in common: the area of their parts in view that they share,
+// over the area either covers (1: the same). Unlike the distance between corners, it isn't thrown by corners pinned
+// to the view's edge (a page bigger than the view): those can sit far apart along the edge round the same page.
+function overlapInView(A, B) {
+  const a = clipPoly(A, VIEW()), b = clipPoly(B, VIEW());
+  if (a.length < 3 || b.length < 3) return 0;
+  const i = polyArea(clipPoly(a, b)), u = polyArea(a) + polyArea(b) - i;
+  return u > 0 ? i / u : 0;
+}
 
 /* ---------- How the picture moves from frame to frame ----------
    Small patches of print inside the outline are looked for again in the next frame, and a map fitted to where
@@ -920,12 +1011,15 @@ function findPatch(px, py, dx, dy) {
 // The page's motion from the previous frame to this one, as an affine map (x' = a x + b y + c, y' = d x + e y + f;
 // near enough for one frame's worth of a moving phone), from patches inside quad Q (previous frame), expected
 // to have moved by about (dx, dy). Null when it can't be told.
+const PM_GRID = 6;   // patches looked for: a grid of PM_GRID x PM_GRID points inside the page
 function pageMotion(Q, dx, dy) {
   if (!mo.prev || !mo.halfPrev) return null;
+  // (patches from the part of the page in view: with a page bigger than the view, most of the page's own area is beyond it)
+  Q = pinned(Q);
   const P = [];
-  for (let j = 0; j < 4; j++) {
-    for (let i = 0; i < 4; i++) {
-      const u = 0.2 + 0.2 * i, v = 0.2 + 0.2 * j;
+  for (let j = 0; j < PM_GRID; j++) {
+    for (let i = 0; i < PM_GRID; i++) {
+      const u = (i + 1) / (PM_GRID + 1), v = (j + 1) / (PM_GRID + 1);
       // a point of the quad, bilinearly
       const x = (1 - v) * ((1 - u) * Q[0][0] + u * Q[1][0]) + v * ((1 - u) * Q[3][0] + u * Q[2][0]);
       const y = (1 - v) * ((1 - u) * Q[0][1] + u * Q[1][1]) + v * ((1 - u) * Q[3][1] + u * Q[2][1]);
@@ -1000,13 +1094,94 @@ function confirmed() {
   const edges = trk.sideOk.filter((n) => n >= 3).length >= 3;
   let ok;
   if (trk.src === "cv") ok = now - trk.cvAt < 700;
-  else if (trk.src !== "ai" || now - trk.aiAt > 1200 || trk.miss >= 2 || trk.far >= 2 || trk.aiD > 0.1) ok = false;
-  else ok = was || (trk.miss === 0 && trk.aiD < (edges ? 0.04 : 0.025) && (trk.agrees >= 2 || edges));
+  else if (trk.src !== "ai" || now - trk.aiAt > 1200 || trk.miss >= 2 || trk.far >= 2 || (trk.aiD > 0.1 && trk.aiO < OVER_FAR)) ok = false;
+  else ok = was || (trk.miss === 0 && (trk.aiD < (edges ? 0.04 : 0.025) || trk.aiO >= OVER_SAME) && (trk.agrees >= 2 || edges || trk.overlaps >= 2));
   if (!ok) return false;
   // (a page that overflows the view is shown clamped to the view's edge; the flag asks the user to move back)
   const m = 0.004 * Math.max(gw, gh);
   trk.cut = !trk.q.every(([x, y]) => x > m && x < gw - m && y > m && y < gh - m);
   return (trk.shown = true);
+}
+
+// The outline to crop to, widened where the AI sees the page reaching clearly further out: a corner of the
+// AI's page more than WIDEN of the diagonal outside the outline is taken instead of the outline's. On John's stapled
+// booklets, curled at the binding and held in the hand, a side of the outline went over to a fold, a printed line or
+// the hand, and the crop cut a strip of the page off. For audit papers a crop with a little desk round it is harmless,
+// one that cuts off text isn't. Sheets under a page peek out less than WIDEN, so a stack's crop doesn't grow.
+// The AI's last answer that could be a page, moved on with the outline since (grey px), if it's recent; or null.
+function aiNow() {
+  const A0 = trk.lastA;
+  if (!A0 || !trk.q || performance.now() - A0.at > 600) return null;
+  return A0.q.map((p, i) => [p[0] + trk.q[i][0] - A0.ref[i][0], p[1] + trk.q[i][1] - A0.ref[i][1]]);
+}
+let WIDEN = 0.03;
+function widened(T) {
+  const A0 = trk.lastA;
+  if (!WIDEN || !A0 || performance.now() - A0.at > 600) return T;
+  // (only with the phone held about still: while it moves, the AI's answer, a few frames old, lags behind the page)
+  if (trk.v && trk.v.some(([x, y]) => Math.abs(x) > 1.5 || Math.abs(y) > 1.5)) return T;
+  // (the AI's page moved on with the outline since)
+  const A = A0.q.map((p, i) => [p[0] + trk.q[i][0] - A0.ref[i][0], p[1] + trk.q[i][1] - A0.ref[i][1]]);
+  if (overlapInView(A, T) < 0.6) return T;
+  let o = 0;
+  for (let i = 0; i < 4; i++) { const a = T[i], b = T[(i + 1) % 4]; o += a[0] * b[1] - b[0] * a[1]; }
+  const sg = o >= 0 ? 1 : -1, lim = WIDEN * Math.hypot(gw, gh);
+  // (how far a point lies outside the outline: the furthest beyond any side)
+  const outside = (p) => {
+    let d = -Infinity;
+    for (let i = 0; i < 4; i++) {
+      const a = T[i], b = T[(i + 1) % 4], L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1e-9;
+      d = Math.max(d, (-sg * ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]))) / L);
+    }
+    return d;
+  };
+  let changed = false;
+  const W = T.map((p, i) => { if (outside(A[i]) > lim) { changed = true; return A[i].slice(); } return p; });
+  return changed && convex(W) && shapedPx(W, 60, 120, 25) ? W : T;
+}
+
+/* ---------- A calm outline on screen ----------
+   CamScanner's outline sits still on a page held still. Here the outline followed (track) is right most of the time,
+   but now and then a side goes over to another edge (a sheet underneath, a printed box) or the outline takes the AI's
+   answer, and goes back a few frames later; with no edges to hold on to it follows the AI's answers, which scatter.
+   On screen that's a twitching, jumping outline. So the outline shown moves with the page itself (the print on it,
+   followed from frame to frame: pageMotion) when the followed outline goes somewhere the page didn't, and goes there
+   too only once the followed outline has stayed there for a moment, gliding there. */
+const calm = { q: null, t: null, M: null, hold: false, n: 0, age: 0, on: true };
+const CALM_NEAR = 0.012, CALM_HOLD = 2, CALM_MAX = 15, CALM_STEP = 6;   // (share of the diagonal; frames; frames; grey px)
+// T: the outline to show in this frame (grey px), or null; sides: how many of its sides sit on paper edges. Returns
+// the outline to draw (grey px), or null.
+function calmView(T, sides = 4) {
+  if (!T || !calm.on) { calm.q = calm.t = calm.M = null; calm.hold = false; calm.n = calm.age = 0; return T; }
+  const D = calm.q, Tp = calm.t;
+  if (!D) { calm.q = T.map((p) => p.slice()); calm.t = T; return calm.q; }
+  calm.t = T;
+  // How the page moved since the last frame: as the print inside the outline shown moved (expected to move as it did
+  // last frame). Without that (blank paper, a blurred frame), as the outline followed moved.
+  const cx = (D[0][0] + D[1][0] + D[2][0] + D[3][0]) / 4, cy = (D[0][1] + D[1][1] + D[2][1] + D[3][1]) / 4, L = calm.M;
+  const M = pageMotion(D, L ? L.a * cx + L.b * cy + L.c - cx : 0, L ? L.d * cx + L.e * cy + L.f - cy : 0);
+  calm.M = M;
+  const near = CALM_NEAR * Math.hypot(gw, gh);
+  // Did the outline followed change its mind, going somewhere the page didn't? (Only the print can tell.) Then the
+  // outline shown stays with the page until the followed one is back with it, or has stayed at its new place for a
+  // few frames (or, if it keeps changing its mind, for a while anyway), and then glides there.
+  const P = M ? moveBy(M, D) : D.map((p, i) => [p[0] + T[i][0] - Tp[i][0], p[1] + T[i][1] - Tp[i][1]]);
+  const e = maxApart(pinned(T), pinned(P));
+  // (a big change that takes the outline closer to where the AI sees the page is the page being found, or found
+  // better: it's shown straight away, gliding quickly; only one away from the AI's page is held)
+  // (only for a big change: the AI's answers on John's pages scatter by a few per cent, and following each was jumpy)
+  const A = aiNow(), toAI = !!A && e >= 3 * near && maxApart(pinned(align(A, T).q), pinned(T)) < maxApart(pinned(align(A, P).q), pinned(P)) - 0.5 * near;
+  if (M && !toAI && maxApart(pinned(T), pinned(moveBy(M, Tp))) >= near) { if (!calm.hold) calm.age = 0; calm.hold = true; calm.n = 0; }
+  else if (calm.hold) calm.n++;
+  if (calm.hold && (e < near || calm.n >= CALM_HOLD || ++calm.age > CALM_MAX)) calm.hold = false;
+  // (otherwise the outline followed: exactly, when it sits on the paper's edges; when it's mostly a guess (no edges to
+  // hold on to: a page bigger than the view, a hand on it) it follows the AI's answers, which scatter, so the one shown
+  // keeps with the page and drifts there slowly. Further off (much further, for a guess), it glides there: at most
+  // CALM_STEP px a frame, unless that would take more than about five frames)
+  const far = e >= (sides >= 2 ? near : 3 * near);
+  const k = calm.hold ? 0 : toAI ? (far ? 0.5 : sides >= 2 ? 1 : 0.5) : far ? Math.min(0.5, Math.max(0.2, CALM_STEP / e)) : sides >= 3 ? 1 : sides === 2 ? 0.5 : 0.15;
+  calm.q = P.map((p, i) => [p[0] + k * (T[i][0] - p[0]), p[1] + k * (T[i][1] - p[1])]);
+  return calm.q;
 }
 
 /* ---------- AI requests ---------- */
@@ -1032,8 +1207,37 @@ function onAIResult(e) {
   ai.n++;
   if (!ai.since) ai.since = now;
   if (now - ai.since >= 1000) { const hz = (ai.n * 1000) / (now - ai.since); ai.hz = ai.hz ? ai.hz * 0.7 + hz * 0.3 : hz; ai.n = 0; ai.since = now; }
+  if (rec.on) st.events.push({ ans: ai.frame, q: r.quad, s: r.score, ms: r.ms, t: now });
   const q = r.quad && r.score >= AI_MIN && area(r.quad) > 0.06 && convex(r.quad) ? r.quad : null;
+  // (an answer no page could look like says nothing about where the page is: it's left out)
+  if (q && SHAPED && !pageShaped(q)) return;
   onFinder(ai.frame, q, "ai");
+}
+// Could a page look like this quad (normalised corners) in the camera's picture? On John's pages (a hand on the page,
+// sheets underneath, printed boxes) the AI now and then answers with one corner pulled far into the page: a shape
+// with a very sharp or very blunt corner, or opposite sides far from parallel. A page seen from a phone held over it,
+// even tilted, keeps its corners between 60 and 120 degrees and its opposite sides within 25 degrees of parallel (the
+// AI's answers, with corners beyond the view pinned to its edge, are allowed 50 to 130, and 30).
+let SHAPED = false, SHOW_SHAPED = true, SNAP_SHAPED = true, OUT_PULL = true;
+const pinnedNorm = (q) => q.map(([x, y]) => [Math.min(1, Math.max(0, x)), Math.min(1, Math.max(0, y))]);
+function pageShaped(q) { return shapedPx(q.map(([x, y]) => [x * gw, y * gh])); }
+// (lo, hi: the corners' limits in degrees; par: opposite sides' limit off parallel. The AI's answers have corners beyond
+// the view pinned to its edge, which bends them a little: they get the wider limits.)
+function shapedPx(P, lo = 50, hi = 130, par = 30) {
+  const dir = [];
+  for (let i = 0; i < 4; i++) {
+    const a = P[(i + 3) % 4], b = P[i], c = P[(i + 1) % 4];
+    const ux = a[0] - b[0], uy = a[1] - b[1], vx = c[0] - b[0], vy = c[1] - b[1];
+    const cos = (ux * vx + uy * vy) / (Math.hypot(ux, uy) * Math.hypot(vx, vy) + 1e-9);
+    const deg = (Math.acos(Math.max(-1, Math.min(1, cos))) * 180) / Math.PI;
+    if (deg < lo || deg > hi) return false;
+    dir.push(Math.atan2(c[1] - b[1], c[0] - b[0]));
+  }
+  for (let i = 0; i < 2; i++) {
+    let d = Math.abs(dir[i] - dir[i + 2] - Math.PI) % (2 * Math.PI);
+    if (Math.min(d, 2 * Math.PI - d) > (par * Math.PI) / 180) return false;
+  }
+  return true;
 }
 
 /* ---------- The camera view ----------
@@ -1078,7 +1282,7 @@ function clearView() {
    picture shown on screen; when both do, the first frames are timed both ways, and copying is kept unless
    drawing is clearly quicker.
    Stills taken by the page are drawn. */
-const rd = { copy: true, draw: false, pick: "", t: { copy: [], draw: [] } };   // (until the check: copies)
+const rd = { copy: true, draw: false, pick: "", t: { copy: [], draw: [] }, slow: 0 };   // (until the check: copies)
 const drawer = { c: [null, null], pick: -1, t: [[], []] };   // canvases: on the graphics chip, in main memory
 const median = (a) => { const s = a.slice().sort((x, y) => x - y); return s[s.length >> 1]; };
 
@@ -1115,8 +1319,11 @@ function fromDrawn(pic, wantAI) {
 }
 
 async function readFrame(vf, wantAI) {
-  // (with both ways usable: drawn first, until the drawing canvas is chosen, then each in turn, then the quicker)
-  let how = rd.pick || (rd.copy && rd.draw ? (drawer.pick < 0 ? "draw" : rd.t.copy.length <= rd.t.draw.length ? "copy" : "draw") : rd.copy ? "copy" : "draw");
+  // (with both ways usable: copied first, a few frames; then drawn, until the drawing canvas is chosen; then each in
+  // turn, then the quicker. Drawing is given up as soon as it's clearly slower than copying: on some phones drawing
+  // a big frame and reading it back takes ten times as long, and timing it over many frames made the outline crawl
+  // for the first seconds)
+  let how = rd.pick || (rd.copy && rd.draw ? (rd.t.copy.length < 6 ? "copy" : drawer.pick < 0 ? "draw" : rd.t.copy.length <= rd.t.draw.length ? "copy" : "draw") : rd.copy ? "copy" : "draw");
   const t0 = performance.now();
   let px;
   if (how === "copy") {
@@ -1130,9 +1337,13 @@ async function readFrame(vf, wantAI) {
   if (how === "draw") px = fromDrawn(vf, wantAI);
   if (!rd.pick) {
     if (rd.copy && rd.draw) {
-      if (how === "copy" || drawer.pick >= 0) rd.t[how].push(performance.now() - t0);
+      const dt = performance.now() - t0;
+      if (how === "copy" || drawer.pick >= 0) rd.t[how].push(dt);
+      // (two drawings in a row more than twice as slow as copying: drawing won't win)
+      if (how === "draw") rd.slow = dt > 20 && dt > 2 * median(rd.t.copy.slice(2)) ? rd.slow + 1 : 0;
+      if (rd.slow >= 2) rd.pick = "copy";
       // (copies are the more exact way: drawing is kept only when it's clearly quicker)
-      if (rd.t.copy.length >= 10 && rd.t.draw.length >= 10) {
+      else if (rd.t.copy.length >= 10 && rd.t.draw.length >= 10) {
         const c = median(rd.t.copy.slice(2)), d = median(rd.t.draw.slice(2));
         rd.pick = c > 10 && d < 0.67 * c ? "draw" : "copy";
       }
@@ -1144,6 +1355,32 @@ async function readFrame(vf, wantAI) {
 
 /* ---------- Frames from the page ---------- */
 const st = { ms: 0, hz: 0, n: 0, since: 0, pad: 0, trace: false, events: [], way: "" };
+
+/* ---------- Recording a scanning session (tests) ----------
+   On a copy of the app served from the test PC (dev/phone.py), the worker can send the PC every frame's grey picture,
+   the AI's picture when it was asked, and what it made of them (the trace, the AI's answers, the classical finder's),
+   so a real session can be replayed exactly (dev/replay.js --rec). Only ever to the address the app was served from,
+   and only when that is this machine (the phone reaches the PC's server through adb reverse): the app as installed
+   from the web never sends anything. */
+const LOCAL = typeof self.location === "object" && /^(localhost|127\.0\.0\.1|\[::1\])$/.test(self.location.hostname);
+const rec = { on: false, url: "", frames: [], bins: [], bytes: 0, busy: false, at: 0, lost: 0 };
+function recFrame(meta, g, a) {
+  // (when the PC can't keep up, frames are left out, and say so)
+  if (rec.bytes > 150e6) { rec.lost++; return; }
+  meta.w = gw; meta.h = gh; meta.g = g.length; meta.a = a ? a.length : 0; meta.lost = rec.lost;
+  rec.frames.push(meta); rec.bins.push(g); if (a) rec.bins.push(a);
+  rec.bytes += g.length + (a ? a.length : 0);
+  recSend();
+}
+function recSend() {
+  const now = performance.now();
+  if (rec.busy || !rec.frames.length || (rec.bytes < 3e6 && now - rec.at < 500)) return;
+  const head = new TextEncoder().encode(JSON.stringify(rec.frames));
+  const body = new Blob([new Uint32Array([head.length]), head, ...rec.bins]);
+  const n = rec.frames.length;
+  rec.frames = []; rec.bins = []; rec.bytes = 0; rec.busy = true; rec.at = now;
+  fetch(rec.url, { method: "POST", body }).then((r) => { if (!r.ok) rec.lost += n; }, () => { rec.lost += n; }).finally(() => { rec.busy = false; });
+}
 
 async function onFrameMsg(m) {
   const t0 = performance.now();
@@ -1158,13 +1395,19 @@ async function onFrameMsg(m) {
   try {
     if (vf) px = await readFrame(vf, wantsAI);
     else if (still) { px = fromDrawn(still, wantsAI); st.way = drawer.pick === 1 ? "still cpu" : "still"; }
+    else if (m.grey) { px = fromGrey(m.grey, m.w, m.h, wantsAI && m.ai); st.way = m.way || ""; }
     else { px = fromRGBA(new Uint8ClampedArray(m.rgba), m.w, m.h, wantsAI); st.way = ""; }
   } catch (err) {
     close();
     self.postMessage({ type: "quad", seq: f, epoch: m.epoch, quad: null, error: String((err && err.message) || err), fallback: !!(vf || still) });
     return;
   }
-  let res = null;
+  let res = null, rg = null, ra = null;
+  if (rec.on) {
+    rg = new Uint8ClampedArray(grey);
+    if (px) { ra = new Uint8Array(AI * AI * 3); for (let i = 0, j = 0; j < ra.length; i += 4, j += 3) { ra[j] = px[i]; ra[j + 1] = px[i + 1]; ra[j + 2] = px[i + 2]; } }
+  }
+  const tt = performance.now();
   try {
     if (px) sendAI(px, f);
     res = track(f, m.cf === undefined ? f : m.cf);
@@ -1174,7 +1417,12 @@ async function onFrameMsg(m) {
     self.postMessage({ type: "quad", seq: f, epoch: m.epoch, quad: null, error: String((err && err.message) || err) });
     return;
   }
-  const shown = res && (st.gate === false || confirmed()) ? res.quad.map(([x, y]) => [Math.min(1, Math.max(0, x)), Math.min(1, Math.max(0, y))]) : null;
+  // (never an outline no page could look like: the AI's odd answers can pull the outline into one)
+  const calmQ = calmView(res && (st.gate === false || confirmed()) && (!SHOW_SHAPED || shapedPx(toPx(res.quad), 60, 120, 25)) ? toPx(res.quad) : null, res ? res.sides : 0);
+  const shown = calmQ ? pinnedNorm(toNorm(calmQ)) : null;
+  // (the crop, if the shutter goes now: the outline shown, widened where the AI sees more of the page; widened on
+  // screen too, it switched with each of the AI's answers and the outline jumped)
+  const crop = calmQ ? pinnedNorm(toNorm(widened(calmQ))) : null;
   // (the outline fades in and out over a few frames rather than blinking on and off)
   view.fade = shown ? Math.min(1, view.fade + 0.34) : Math.max(0, view.fade - 0.25);
   let drawn = false;
@@ -1187,13 +1435,31 @@ async function onFrameMsg(m) {
   st.n++;
   if (!st.since) st.since = t0;
   if (t0 - st.since >= 1000) { const hz = (st.n * 1000) / (t0 - st.since); st.hz = st.hz ? st.hz * 0.7 + hz * 0.3 : hz; st.n = 0; st.since = t0; }
+  const ev = st.trace ? st.events.splice(0) : undefined;
   self.postMessage({
-    type: "quad", seq: f, epoch: m.epoch, quad: shown, cut: !!(res && trk.cut), sides: res ? res.sides : 0, src: res ? trk.src : "", jump: !!trk.jumped, drawn,
+    type: "quad", seq: f, epoch: m.epoch, quad: shown, crop, cut: !!(res && trk.cut), sides: res ? res.sides : 0, src: res ? trk.src : "", jump: !!trk.jumped, drawn,
     sig: signature(), stats: { liveMs: st.ms, liveHz: st.hz, aiMs: ai.ms, aiHz: ai.hz, way: st.way },
-    trace: st.trace ? { ok: trk.sideOk.join(","), ev: st.events.splice(0), ts, wt: performance.now(), tq: res ? res.quad : null } : undefined,
+    trace: st.trace ? { ok: trk.sideOk.join(","), ev, ts, wt: performance.now(), tq: res ? res.quad : null } : undefined,
   });
+  if (rec.on) {
+    recFrame({ f, cf: m.cf === undefined ? f : m.cf, t0, tt, ts, ms, way: st.way, ai: px ? ai.seq : 0, q: shown, tq: res ? res.quad : null,
+      ok: trk.sideOk.join(","), sides: res ? res.sides : 0, src: res ? trk.src : "", cut: !!(res && trk.cut), jump: !!trk.jumped, ev }, rg, ra);
+  }
   trk.jumped = false;
   keepFrame();
+}
+
+// Frames are followed one at a time, in order: the page sends the next camera frame before the answer about the last
+// one is back (so the worker needn't wait for it), and that one waits here until the last is done.
+const fq = { busy: false, list: [] };
+async function nextFrame() {
+  if (fq.busy) return;
+  fq.busy = true;
+  while (fq.list.length) {
+    const m = fq.list.shift();
+    try { await onFrameMsg(m); } catch (_) { /* answered inside, or not at all */ }
+  }
+  fq.busy = false;
 }
 
 // Which ways of reading VideoFrames give the same picture as the video on screen (same way up, same framing)?
@@ -1222,33 +1488,47 @@ async function onCheck(m) {
   } finally {
     try { vf.close(); } catch (_) { /* already closed */ }
   }
-  rd.copy = corrCopy > 0.85; rd.draw = corrDraw > 0.85; rd.pick = ""; rd.t = { copy: [], draw: [] };
+  rd.copy = corrCopy > 0.85; rd.draw = corrDraw > 0.85; rd.pick = ""; rd.t = { copy: [], draw: [] }; rd.slow = 0;
   if (st.forceRead) { rd.copy = rd.copy && st.forceRead === "copy"; rd.draw = rd.draw && st.forceRead === "draw"; }   // tests
   self.postMessage({ type: "check", epoch: m.epoch, ok: rd.copy || rd.draw, copy: rd.copy, draw: rd.draw, corrCopy, corrDraw, msCopy, msDraw, format });
 }
 
 self.onmessage = (e) => {
   const m = e.data || {};
-  if (m.type === "frame") onFrameMsg(m);
+  if (m.type === "frame") { fq.list.push(m); nextFrame(); }
   else if (m.type === "check") onCheck(m);
   else if (m.type === "port") { ai.port = m.port; ai.port.onmessage = onAIResult; ai.busy = false; }
   else if (m.type === "ai-off") { ai.port = null; ai.busy = false; }
-  else if (m.type === "cv") onFinder(m.seq, m.quad, "cv");
-  else if (m.type === "reset") { trk.reset(); trk.cfOf.clear(); ai.busy = false; ai.seq++; ai.prev = null; mo.prev = null; mo.halfPrev = null; clearView(); }
+  else if (m.type === "cv") { if (rec.on) st.events.push({ cv: m.seq, q: m.quad, t: performance.now() }); onFinder(m.seq, m.quad, "cv"); }
+  else if (m.type === "reset") {
+    if (rec.on) st.events.push({ reset: 1, t: performance.now() });
+    // (frames still waiting from before it: the page has forgotten them)
+    for (const w of fq.list.splice(0)) { try { if (w.frame) w.frame.close(); if (w.still) w.still.close(); } catch (_) { /* closed */ } }
+    trk.reset(); calm.q = null; trk.cfOf.clear(); ai.busy = false; ai.seq++; ai.prev = null; mo.prev = null; mo.halfPrev = null; clearView(); }
   else if (m.type === "view") { view.ctx = m.canvas.getContext("2d", { alpha: false }); view.dpr = m.dpr || 1; }
   else if (m.type === "view-size") {
     if (view.ctx) { view.ctx.canvas.width = view.w = m.w; view.ctx.canvas.height = view.h = m.h; view.dpr = m.dpr || view.dpr; clearView(); }
   }
   else if (m.type === "view-off") { clearView(); view.w = view.h = 0; }
   else if (m.type === "look") view.steady = !!m.steady;
-  else if (m.type === "ease") ai.ease = !!m.on;
+  else if (m.type === "ease") { ai.ease = !!m.on; if (rec.on) st.events.push({ ease: ai.ease ? 1 : 0, t: performance.now() }); }
   else if (m.type === "debug") {
-    st.pad = m.liveMs || 0; st.trace = !!m.trace; st.forceRead = m.read || "";
+    // (rec: a name for the session being recorded, or "" to stop; see recFrame)
+    if (m.rec !== undefined) { rec.on = !!m.rec && LOCAL; rec.url = rec.on ? new URL("rec?s=" + encodeURIComponent(m.rec), self.location.href).href : ""; rec.lost = 0; }
+    st.pad = m.liveMs || 0; st.trace = !!m.trace || rec.on; st.forceRead = m.read || "";
     if (m.pick) PICK = m.pick;
     if (m.switch) SWITCH = m.switch;
     if (m.gate !== undefined) st.gate = !!m.gate;
     if (m.agree) { AGREE_FIRM = m.agree[0]; AGREE = m.agree[1]; }
     if (m.inner) { INNER = m.inner[0]; INNER_R = m.inner[1]; }
     if (m.flat !== undefined) FLAT_IN = m.flat;
+    if (m.calm !== undefined) calm.on = !!m.calm;
+    if (m.shaped !== undefined) SHAPED = !!m.shaped;
+    if (m.showShaped !== undefined) SHOW_SHAPED = !!m.showShaped;
+    if (m.over) { OVER_SAME = m.over[0]; OVER_FAR = m.over[1]; }
+    if (m.band !== undefined) BAND = !!m.band;
+    if (m.snapShaped !== undefined) SNAP_SHAPED = !!m.snapShaped;
+    if (m.outPull !== undefined) OUT_PULL = !!m.outPull;
+    if (m.widen !== undefined) WIDEN = +m.widen;
   }
 };

@@ -42,6 +42,40 @@ Looking closer: `node dev/replay.js live-worker.js stack2_34 --dump dev/runs/x.j
 `python dev/drawrun.py stack2_34 dev/runs/x.png 15 dev/runs/x.json` draws the outline (blue; more runs in orange and
 green) and the AI's answer (red) on every 15th frame. `--trace a-b` prints the tracker's decisions for frames a..b.
 
+## John's phone: recording real scanning, replaying it
+
+With the phone on USB (USB debugging on, this PC allowed; platform-tools from `winget install Google.PlatformTools`):
+
+```
+python dev/recserve.py . 8000          # serves this folder to the phone, saves recordings (keep it running)
+python dev/phone.py connect 8000       # adb forward (DevTools) + adb reverse (the phone's localhost:8000 is this PC)
+python dev/phone.py open               # opens http://localhost:8000/ in Chrome on the phone: a test copy, its own
+                                       # storage, no service worker, every reload gets the files on disk now
+python dev/phone.py rec s1             # once the camera is open: the live worker sends every frame to the PC
+python dev/phone.py stop
+```
+
+`phone.py status`, `phone.py eval "<js>"`, `phone.py evalf dev/phone_watch.js` (how the camera screen runs, every 250
+ms: frame path, view in step or video, speed) and `phone.py shot out.png` look at the phone; `phone_profile.py 6`
+profiles the live worker there. A recording (`videos/rec_<name>/`, ignored by git: it shows John's documents) holds
+each frame's grey picture (as the worker saw it, after the blur), the AI's picture when it was asked, the AI's
+answers, the classical finder's, and what the worker made of each frame. The recording switch only works when the
+app is served from this PC (`localhost`); the app installed from the web never sends anything.
+
+```
+python dev/recmotion.py s1                                   # the page's motion frame to frame (for the shake numbers)
+node dev/replay_rec.js live-worker.js s1 --dump dev/runs/a.json   # what this worker would have shown on the phone
+python dev/recview.py s1 dev/runs/a.png 100-400:20 --run dev/runs/a.json   # frames, outlines drawn on them
+```
+
+`replay_rec.js` feeds the recorded frames and answers to the worker exactly as they came on the phone; with the worker
+the phone ran, it gives back what the phone showed (to sub-pixel rounding of the recorded grey). It prints the share
+of frames with an outline shown, blinks, shake (how far the outline moves against the page from frame to frame while
+shown, px of the 640 px picture) and jumps (> 1% of the diagonal in one frame). There is no truth on real pages (marking
+the top page's corners by eye on John's stapled stacks wasn't reliable: the sheets overlap by millimetres), so look at
+the frames where two workers differ with `recview.py` before believing a change. `rectruth.py` can hold corners marked
+by eye where they are clear.
+
 ## The app in a browser
 
 These start the app from a folder (`dev/serve.py` or `python -m http.server`) in Chromium with a test video as the

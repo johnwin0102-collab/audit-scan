@@ -58,6 +58,25 @@ or test that covers it.
 - Shown: AI agreed lately (< 1.2 s), not 2 misses, not 2 far answers; a new outline waits for a second agreeing answer
   or ≥ 3 edges. A page that overflows the view is shown clamped (cut flag → hint "Move back…", auto-capture after a
   2.5× longer hold). Distances between AI and outline are measured with both clamped to the view.
+- Calm (1.3.4, `calmView`): the outline drawn is the followed outline, except when that goes somewhere the page didn't
+  (judged against the print inside the drawn outline, `pageMotion`, sampled on a 6 x 6 grid in the part of the page in
+  view): then the drawn outline stays with the page until the followed one is back with it or has stayed at its new
+  place for 2 frames (at most 15), and glides there at most 6 px a frame (at least 20% of the way). A followed outline
+  with fewer than 2 sides on edges (a guess from the AI's answers) is drifted to slowly (15% a frame; 50% with 2 sides)
+  unless more than 3 x 1.2% of the diagonal away.
+- Shapes (1.3.4, `shapedPx`): an outline of our own (snapped, followed or shown) with a corner under 60° or over 120°, or
+  opposite sides more than 25° off parallel, isn't taken: a snap like that is refused, a followed outline like that is
+  dropped (found afresh from the next AI answer; it once stayed twisted for seconds while a page was turned in the
+  hand), and one is never shown. The AI's answers get 50–130° and 30° (corners beyond the view pinned to its edge bend
+  them); an answer outside that says nothing to the show rule.
+- Shown (1.3.4): as before, or, when the AI's page and the outline cover about the same part of the view (the parts in
+  view overlap 85%+, `overlapInView`), even with corners further apart; "well away" also needs the overlap under 75%.
+  On John's pages this doubled how often the outline is shown; on the synthetic stacks with a less exact AI it shows
+  more frames on the sheet under the page.
+- Widened (1.3.4, `widened`): with the phone about still, a corner of the AI's last page-shaped answer more than 3% of
+  the diagonal outside the outline is taken for the outline shown (and so the crop): a side on a fold, printed line or
+  hand inside a curled booklet page cut the crop. Pulls outward (`notePulls`): the AI twice running puts a side 4%+
+  further out at both ends (within 15%): the side goes there, edge or not.
 - Capture: the outline shown is the crop (refined on edges in the photo) when it really sits on 3+ edges there;
   otherwise AI, second looks and the classical finder compete. A cut-off page is cropped as it is (no perspective
   correction, no A4 snap, no flattening).

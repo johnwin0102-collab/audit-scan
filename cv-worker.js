@@ -752,7 +752,10 @@ function pickQuad(small, ai, live, looks) {
     };
     if (live) add(refineQuad(small, live) || live, "live", 0.3);
     if (ai) add(refineQuad(small, ai) || ai, "ai", 0.3);
-    for (const l of looks || []) add(refineQuad(small, l.q) || l.q, l.src || "look", 0);
+    // (a second look at a crop with part of the first outline cut away competes at a disadvantage: on John's curled
+    // booklets held in the hand it found half the page, as A4-shaped as the whole one on its side, on a printed line,
+    // and the crop cut the page in half)
+    for (const l of looks || []) add(refineQuad(small, l.q) || l.q, l.src || "look", /^cut_/.test(l.src || "") ? -0.4 : 0);
     if (!cands.length) for (const c of quadCandidates(small).slice(0, 5)) add(c.q, "edges", 0);
     if (!cands.length) {
       // Nothing looks like a page; keep what was shown, or what the AI said, as before.
