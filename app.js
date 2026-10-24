@@ -4,7 +4,7 @@
 "use strict";
 
 (() => {
-  const VERSION = "1.3.5";
+  const VERSION = "1.3.6";
 
   const AREAS = [
     { value: "Mixed", label: "Mixed (Claude sorts)", short: "" },
@@ -1481,7 +1481,8 @@
     S.editor = null;
   }
 
-  function renderEditor() {
+  // (pre: an object URL of the page's picture made, and decoded, beforehand: see slideTo)
+  function renderEditor(pre) {
     const p = curPage();
     if (!p || !S.batch) { show("review"); return; }
     const ed = S.editor;
@@ -1491,16 +1492,14 @@
     const flattened = p.flat === true && p.flatInfo && p.flatInfo.applied;
     el.edMeta.textContent = [filterLabel(p.filter), flattened ? "flattened" : "", p.rotation ? `rotated ${p.rotation}°` : "",
       p.auto === false ? "not cropped" : ""].filter(Boolean).join(" · ");
-    if (edUrl) URL.revokeObjectURL(edUrl);
-    edUrl = URL.createObjectURL(p.output);
-    el.edImg.src = edUrl;
+    if (edUrl && edUrl !== pre) URL.revokeObjectURL(edUrl);
+    edUrl = pre || URL.createObjectURL(p.output);
+    if (el.edImg.src !== edUrl) el.edImg.src = edUrl;
     el.edImg.alt = `Page ${idx + 1}`;
     const pf = normFilter(p.filter);
     for (const b of el.filterChips.children) b.setAttribute("aria-pressed", String(b.dataset.filter === pf));
     el.btnApplyAll.hidden = ids.length < 2;
     el.btnApplyAll.textContent = `Use ${filterLabel(pf)} on all ${ids.length} pages`;
-    el.btnMoveUp.disabled = idx <= 0;
-    el.btnMoveDown.disabled = idx >= ids.length - 1;
     el.btnCrop.disabled = !p.frame;
     el.btnFlatten.disabled = !p.frame || p.auto === false;
     el.btnFlatten.setAttribute("aria-pressed", String(p.flat === true));
@@ -1595,42 +1594,85 @@
     if (p) rerender(p, { rotation: ((p.rotation || 0) + 90) % 360 }, false);
   }
 
-  // Another page of the batch in the editor: dir -1 the one before, +1 the one after (a swipe on the page). Moving
-  // a page in the batch is movePage, below.
-  function showPage(dir) {
-    const p = curPage();
-    if (!p || !S.editor || S.editor.busy || S.editor.crop) return;
-    const ids = S.batch.pageIds, j = ids.indexOf(p.id) + dir;
-    if (j < 0 || j >= ids.length) return;
-    S.editor = { id: ids[j], crop: false, quad: null, busy: false, delArmed: false };
-    renderEditor();
-    // (a short slide in from the side it came from)
-    try { el.edImg.animate([{ transform: `translateX(${dir * 48}px)`, opacity: 0.3 }, { transform: "none", opacity: 1 }], { duration: 180, easing: "ease-out" }); }
-    catch (_) { /* no animation here */ }
+  // Swipes on the page in the editor, as in a phone's photo gallery: the page follows the finger; let go past a third
+  // of the way, or flick it, and it slides out while the next page (swiping left) or the one before slides in;
+  // otherwise it slides back. Nothing fades or blinks: the next picture is decoded before it comes in.
+  const swipe = { s: null, busy: false };
+  function slide(from, to, ms) {
+    const a = el.edImg.animate([{ transform: `translateX(${from}px)` }, { transform: `translateX(${to}px)` }], { duration: ms, easing: "cubic-bezier(.2, .7, .3, 1)", fill: "forwards" });
+    return a.finished.then(() => a, () => a);
   }
-  // Swipes on the page in the editor: to the left for the next page, to the right for the one before.
+  async function slideTo(dir, dx) {
+    const p = curPage();
+    if (!p) return;
+    const ids = S.batch.pageIds, j = ids.indexOf(p.id) + dir, next = S.pages.get(ids[j]);
+    const w = el.edImg.parentElement.clientWidth;
+    swipe.busy = true;
+    try {
+      const url = URL.createObjectURL(next.output), pre = new Image();
+      pre.src = url;
+      const [out] = await Promise.all([slide(dx, -dir * w, 160), pre.decode().catch(() => {})]);
+      S.editor = { id: next.id, crop: false, quad: null, busy: false, delArmed: false };
+      renderEditor(url);
+      // (the picture is held off screen on the other side by its own style while the animations change over, so no
+      // frame of it ever shows in the middle)
+      el.edImg.style.transform = `translateX(${dir * w}px)`;
+      out.cancel();
+      const inn = await slide(dir * w, 0, 220);
+      el.edImg.style.transform = "";
+      inn.cancel();
+    } finally {
+      swipe.busy = false;
+    }
+  }
   function watchSwipes() {
     const stage = el.edImg.parentElement;
-    let s = null;
-    stage.addEventListener("pointerdown", (e) => { s = S.editor && !S.editor.crop && e.isPrimary ? { x: e.clientX, y: e.clientY, t: performance.now() } : null; });
-    stage.addEventListener("pointerup", (e) => {
-      if (!s) return;
-      const dx = e.clientX - s.x, dy = e.clientY - s.y, dt = performance.now() - s.t;
-      s = null;
-      if (Math.abs(dx) > 50 && Math.abs(dx) > 1.5 * Math.abs(dy) && dt < 800) showPage(dx < 0 ? 1 : -1);
+    const at = () => { const p = curPage(); return p ? S.batch.pageIds.indexOf(p.id) : -1; };
+    stage.addEventListener("pointerdown", (e) => {
+      swipe.s = e.isPrimary && S.editor && !S.editor.crop && !S.editor.busy && !swipe.busy ? { x: e.clientX, y: e.clientY, t: performance.now(), dx: 0, on: false } : null;
     });
-    stage.addEventListener("pointercancel", () => { s = null; });
+    stage.addEventListener("pointermove", (e) => {
+      const s = swipe.s;
+      if (!s) return;
+      const dx = e.clientX - s.x, dy = e.clientY - s.y;
+      if (!s.on) {
+        if (Math.abs(dy) > 12 && Math.abs(dy) > Math.abs(dx)) { swipe.s = null; return; }
+        if (Math.abs(dx) < 8) return;
+        s.on = true;
+        try { stage.setPointerCapture(e.pointerId); } catch (_) { /* fine without */ }
+      }
+      // (past the first or the last page it gives only a little: there's nothing more that way)
+      const i = at(), end = (dx > 0 && i <= 0) || (dx < 0 && i >= S.batch.pageIds.length - 1);
+      s.dx = end ? dx / 4 : dx;
+      el.edImg.style.transform = `translateX(${s.dx}px)`;
+    });
+    const up = async () => {
+      const s = swipe.s;
+      swipe.s = null;
+      if (!s || !s.on) return;
+      const w = stage.clientWidth, dt = Math.max(1, performance.now() - s.t), dir = s.dx < 0 ? 1 : -1, j = at() + dir;
+      const go = (Math.abs(s.dx) > w / 3 || (Math.abs(s.dx) > 40 && Math.abs(s.dx) / dt > 0.5)) && j >= 0 && j < S.batch.pageIds.length;
+      if (go) { await slideTo(dir, s.dx); return; }
+      const back = await slide(s.dx, 0, 180);
+      el.edImg.style.transform = "";
+      back.cancel();
+    };
+    stage.addEventListener("pointerup", up);
+    stage.addEventListener("pointercancel", up);
   }
 
+  // Move the page shown one place earlier or later in the batch (it stays on screen; say where it went).
   async function movePage(dir) {
     const p = curPage();
     if (!p) return;
     const ids = S.batch.pageIds;
     const i = ids.indexOf(p.id), j = i + dir;
-    if (i < 0 || j < 0 || j >= ids.length) return;
+    if (i < 0) return;
+    if (j < 0 || j >= ids.length) { toast(dir < 0 ? "This is already the first page." : "This is already the last page.", 2000); return; }
     [ids[i], ids[j]] = [ids[j], ids[i]];
     await saveBatch().catch(() => {});
     renderEditor();
+    toast(`Moved to page ${j + 1} of ${ids.length}.`, 2000);
   }
 
   let delTimer = 0;

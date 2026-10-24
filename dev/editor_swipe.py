@@ -9,17 +9,23 @@ repo, port = sys.argv[1], int(sys.argv[2])
 video = sys.argv[3] if len(sys.argv) > 3 else "wood"
 
 
-async def swipe(pg, dx):
+async def swipe(pg, dx, steps=8, gap=16):
     box = await pg.locator(".ed-stage").bounding_box()
     x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
     cdp = await pg.context.new_cdp_session(pg)
     pts = lambda px: [{"x": px, "y": y}]
     await cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": pts(x)})
-    for k in range(1, 9):
-        await cdp.send("Input.dispatchTouchEvent", {"type": "touchMove", "touchPoints": pts(x + dx * k / 8)})
-        await pg.wait_for_timeout(16)
+    for k in range(1, steps + 1):
+        await cdp.send("Input.dispatchTouchEvent", {"type": "touchMove", "touchPoints": pts(x + dx * k / steps)})
+        await pg.wait_for_timeout(gap)
     await cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
-    await pg.wait_for_timeout(400)
+    await pg.wait_for_timeout(900)
+
+
+# Each screen frame during a swipe: which picture is shown and how far it's moved (px), to check nothing blinks.
+FRAMES = """() => { const L = window.__fr = []; const img = document.getElementById('edImg');
+  const step = () => { const m = new DOMMatrix(getComputedStyle(img).transform); L.push([img.src.slice(-12), Math.round(m.m41)]); if (L.length < 200) requestAnimationFrame(step); };
+  requestAnimationFrame(step); }"""
 
 
 async def state(pg):
@@ -53,8 +59,19 @@ async def main():
             await pg.locator("#grid li").first.click()
             await pg.wait_for_function("document.getElementById('scrEditor').hidden === false")
             s0 = await state(pg)
+            await pg.evaluate(FRAMES)
             await swipe(pg, -160)
+            fr = await pg.evaluate("window.__fr")
             s1 = await state(pg)
+            # the new picture must first appear off to the right and come in, never in the middle straight away
+            new = [f[1] for f in fr if f[0] == s1["src"][-12:]]
+            print("new picture's first positions:", new[:6], "... last", new[-1:] if new else None)
+            ok &= bool(new) and new[0] > 100 and new[-1] == 0
+            # a short, slow drag slides back: same page
+            await swipe(pg, -60, steps=12, gap=40)
+            sb = await state(pg)
+            print("short drag:", sb["title"])
+            ok &= sb["id"] == s1["id"]
             await swipe(pg, -160)
             s2 = await state(pg)
             await swipe(pg, 160)
@@ -62,12 +79,17 @@ async def main():
             print("start ", s0["title"]); print("left  ", s1["title"]); print("left  ", s2["title"]); print("right ", s3["title"])
             ok &= s1["id"] == s0["ids"][1] and s2["id"] == s0["ids"][2] and s3["id"] == s0["ids"][1]
             ok &= s1["src"] != s0["src"] and s2["src"] != s1["src"]
-            # Move: the page shown (now the 2nd) goes one place earlier; it stays on screen as page 1
+            # Move: the page shown (now the 2nd) goes one place earlier; it stays on screen as page 1, and says so
             await pg.click("#btnMoveUp")
             await pg.wait_for_timeout(300)
             s4 = await state(pg)
-            print("move  ", s4["title"], "order changed:", s4["ids"] != s3["ids"])
+            t1 = await pg.evaluate("document.getElementById('toast').textContent")
+            print("move  ", s4["title"], "order changed:", s4["ids"] != s3["ids"], "| message:", t1)
             ok &= s4["id"] == s3["id"] and s4["ids"][0] == s3["id"] and s4["title"].startswith("Page 1")
+            await pg.click("#btnMoveUp")
+            await pg.wait_for_timeout(300)
+            t2 = await pg.evaluate("document.getElementById('toast').textContent")
+            print("move again on page 1 | message:", t2)
             await b.close()
     finally:
         srv.terminate()
