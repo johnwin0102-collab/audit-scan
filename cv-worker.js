@@ -270,12 +270,22 @@ function insetQuad(q, t) {
 
 const isFull = (q) => q.every((pt, i) => Math.abs(pt[0] - FULL[i][0]) < 1e-6 && Math.abs(pt[1] - FULL[i][1]) < 1e-6);
 
+// Does the outline run along the edge of the photo (a page that overflowed the view, so only part of it is
+// in the picture)?
+const cutOff = (q) => !isFull(q) && q.some(([x, y]) => x < 0.004 || y < 0.004 || x > 0.996 || y > 0.996);
+
 // Corners in pixels (pulled in slightly) and the output size for normalised quad q.
 function pageGeometry(src, q) {
   const W = src.cols, H = src.rows;
   const p = (isFull(q) ? q : insetQuad(q, FLAT.INSET)).map(([x, y]) => [x * W, y * H]);
   let ow = Math.max(dist(p[0], p[1]), dist(p[3], p[2]));
   let oh = Math.max(dist(p[0], p[3]), dist(p[1], p[2]));
+  if (cutOff(q)) {
+    // Part of the page is outside the photo: what's there is cropped as it is. Its true shape can't be
+    // known, so neither the perspective correction nor A4 proportions apply.
+    const s = Math.min(1, MAX_OUT / Math.max(ow, oh));
+    return { p, ow: Math.max(1, Math.round(ow * s)), oh: Math.max(1, Math.round(oh * s)), cut: true };
+  }
   // Correct the proportions for perspective; keep the longer measured side for resolution.
   const r = realAspect(p, W, H), measured = ow / oh;
   if (r && r / measured > 0.6 && r / measured < 1.6) {
@@ -315,7 +325,8 @@ function warp(src, q) {
 // Crop, straighten and, when asked, flatten a page that wasn't lying flat (flatten.js).
 // Returns { mat, flat } where flat says what flattening did (null when it wasn't tried).
 function cropPage(src, q, flatten) {
-  if (flatten && !isFull(q)) {
+  // (a page that overflowed the view is cropped as it is: flattening needs the whole page)
+  if (flatten && !isFull(q) && !cutOff(q)) {
     const { p, ow, oh } = pageGeometry(src, q);
     try {
       const t0 = Date.now();
@@ -721,31 +732,35 @@ function a4Likeness(q, W, H) {
 }
 
 // Choose the page's corners for `small` (RGBA, ~900 px). ai: the AI's first outline on this photo;
-// looks: its second looks at crops [{ q, src }]; live: the steady outline from the live view.
-// Returns { q, src, cands } with candidates best first.
+// looks: its second looks at crops [{ q, src }]; live: the outline shown on the live view as the shutter went,
+// confirmed there by the AI's looks at the camera frames. Returns { q, src, cands } with candidates best first.
+// With a live outline, the crop is what was shown (what you see is what you get), refined onto the paper's
+// edges at the photo's resolution; another outline is taken only when it's the same page (overlapping it well)
+// and sits clearly better on paper edges. Without one, the AI's outline, its second looks and the classical edge
+// finder compete on edge support, A4 shape and overlap with the AI's first outline.
 function pickQuad(small, ai, live, looks) {
   const W = small.cols, H = small.rows;
   const gray = new cv.Mat();
   try {
     cv.cvtColor(small, gray, cv.COLOR_RGBA2GRAY);
     cv.GaussianBlur(gray, gray, new cv.Size(5, 5), 0);
-    const cands = [];
+    let cands = [];
     const add = (q, src, bonus) => {
       if (!q || !quadPlausible(q, W, H)) return;
       if (cands.some((c) => maxDelta(c.q, q) < 0.008)) return;
       cands.push({ q, src, bonus });
     };
+    if (live) add(refineQuad(small, live) || live, "live", 0.3);
     if (ai) add(refineQuad(small, ai) || ai, "ai", 0.3);
     for (const l of looks || []) add(refineQuad(small, l.q) || l.q, l.src || "look", 0);
-    if (live) add(refineQuad(small, live) || live, "live", 0);
     if (!cands.length) for (const c of quadCandidates(small).slice(0, 5)) add(c.q, "edges", 0);
     if (!cands.length) {
-      // Nothing looks like a page; keep what the AI said, as before.
-      const q = ai || live || null;
-      return { q, src: q ? (ai ? "ai" : "live") : null, cands: q ? [{ q, src: ai ? "ai" : "live" }] : [] };
+      // Nothing looks like a page; keep what was shown, or what the AI said, as before.
+      const q = live || ai || null;
+      return { q, src: q ? (live ? "live" : "ai") : null, cands: q ? [{ q, src: live ? "live" : "ai" }] : [] };
     }
     const st = stepImages(gray);
-    const ref = ai || live;
+    const ref = live || ai;
     const sum = (a) => a.reduce((t, v) => t + v, 0);
     const score = (c) => {
       const e = edgeSupport(st, c.q);
@@ -756,6 +771,12 @@ function pickQuad(small, ai, live, looks) {
       c.score = sum(e.near) + 0.5 * sum(e.on) + 0.5 * c.a4 + c.bonus + (ref ? 0.5 * c.iou : 0);
     };
     cands.forEach(score);
+    // The outline shown stands (what you see is what you get) when it really sits on paper edges in the photo
+    // (three sides or more): then only an outline of the same page that sits clearly better can replace it. An
+    // outline that was shown but isn't on the paper here (the shutter went as the phone moved, say) competes as
+    // one candidate among the others.
+    const L = cands.find((c) => c.src === "live");
+    if (L && sum(L.sides) >= 2.5) cands = cands.filter((c) => c === L || (quadIoU(c.q, L.q) > 0.8 && c.score > L.score + 0.3));
     cands.sort((a, b) => b.score - a.score);
     // The best outline has three good sides and one off the paper: move that side onto the edge.
     const top = cands[0];

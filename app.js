@@ -4,7 +4,7 @@
 "use strict";
 
 (() => {
-  const VERSION = "1.3.2";
+  const VERSION = "1.3.3";
 
   const AREAS = [
     { value: "Mixed", label: "Mixed (Claude sorts)", short: "" },
@@ -1112,14 +1112,17 @@
       if (cam.misses >= 3 || sigDiff(cam.sig, cam.capturedSig) > 14) cam.armed = true;
     }
     const auto = autoOn();
+    // (a page that overflows the view is captured as it shows, but only after a longer hold, with the hint to
+    // move back meanwhile: the shutter works any time)
     const progress = auto && cam.armed && cam.lastQuad && cam.steadySince && cam.inFlight < MAX_IN_FLIGHT
-      ? Math.min(1, (now - cam.steadySince) / HOLD_MS) : 0;
+      ? Math.min(1, (now - cam.steadySince) / (cam.cut ? 2.5 * HOLD_MS : HOLD_MS)) : 0;
     cam.showSteady = progress > 0;
     setRing(progress);
     if (progress >= 1) { captureFromCamera(); return; }
     let hint;
-    if (!cam.lastQuad) hint = cam.cut ? "Move back to fit the whole page" : cam.lostSince && now - cam.lostSince > 3000 ? "No page found. Try a darker background, or tap the shutter" : "Point the camera at a page";
+    if (!cam.lastQuad) hint = cam.lostSince && now - cam.lostSince > 3000 ? "No page found. Try a darker background, or tap the shutter" : "Point the camera at a page";
     else if (!cam.armed && auto) hint = "Captured. Turn to the next page";
+    else if (cam.cut) hint = "Move back to fit the whole page";
     else if (auto) hint = cam.steadySince ? "Hold steady…" : "Page found";
     else hint = "Page found. Tap the shutter";
     setHint(hint);
@@ -1144,7 +1147,9 @@
     if (engine.state !== "ready") { toast("The scanner is still loading."); return; }
     if (!cam.stream || !S.batch || cam.inFlight >= MAX_IN_FLIGHT) return;
     const now = performance.now();
-    const previewQuad = cam.lastQuad && now - cam.lastQuadAt < 500 ? cam.lastQuad.map(([x, y]) => [clamp(x, 0, 1), clamp(y, 0, 1)]) : null;
+    // the outline on screen as the shutter went (none if it's gone or stale: the crop then comes from the photo alone)
+    const seen = cam.shown || cam.lastQuad;
+    const previewQuad = seen && cam.lastQuad && now - cam.lastQuadAt < 200 ? seen.map(([x, y]) => [clamp(x, 0, 1), clamp(y, 0, 1)]) : null;
     cam.armed = false;
     cam.capturedAt = now;
     cam.capturedSig = cam.sig;
@@ -1157,10 +1162,11 @@
     let bitmap;
     try { bitmap = await createImageBitmap(el.video); }
     catch (_) { toast("That frame couldn't be captured. Try again."); return; }
-    // Ask the AI page finder about this exact frame. The steady outline from the live view goes along
-    // as a second opinion; the engine keeps whichever outline best matches the paper's edges.
+    // Ask the AI page finder about this exact frame. The outline shown on the live view goes along too: the
+    // crop is that outline (what you see is what you get), refined on the paper's edges. Without one, the AI's
+    // second looks at crops help separate the page from papers around it.
     const hint = finder.state === "ready" ? await findPage(bitmap) : null;
-    const looks = hint ? await secondLooks(bitmap, hint) : [];
+    const looks = hint && !previewQuad ? await secondLooks(bitmap, hint) : [];
     await processCapture(bitmap, hint, previewQuad, looks);
   }
 
