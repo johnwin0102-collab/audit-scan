@@ -1197,6 +1197,52 @@
     await processCapture(bitmap, hint, previewQuad, looks);
   }
 
+  /* ---------- Experiment: SlimSAM re-crops captured pages (test copy only) ----------
+     On the copy served from the test PC, with as.samTest set, each captured page is traced again in the background by
+     SlimSAM (dev/sam-worker.js; the model is on the PC only) from the AI's outline, and re-cropped when SlimSAM's page
+     differs. Not part of the app as released. */
+  const sam = { on: location.hostname === "localhost" && ls.get("as.samTest") === "1", worker: null, queue: [], busy: false, seq: 0, ms: 0, n: 0 };
+  function samLater(page, hint) {
+    if (!sam.on || !hint) return;
+    sam.queue.push({ page, hint, quad: page.quad });
+    samNext();
+  }
+  async function samNext() {
+    if (sam.busy || !sam.queue.length) return;
+    sam.busy = true;
+    const { page, hint, quad } = sam.queue.shift();
+    try {
+      if (!sam.worker) sam.worker = new Worker("dev/sam-worker.js", { type: "module" });
+      const bitmap = await createImageBitmap(page.frame);
+      const id = ++sam.seq;
+      const r = await new Promise((res) => {
+        const on = (e) => { if (e.data && e.data.id === id) { sam.worker.removeEventListener("message", on); res(e.data); } };
+        sam.worker.addEventListener("message", on);
+        sam.worker.postMessage({ id, bitmap, hint, dir: ls.get("as.samDir", "slimsam"), threads: 3 }, [bitmap]);
+      });
+      if (r.error) console.warn("SlimSAM", r.error);
+      if (r.ms) { sam.ms = r.ms; sam.n++; }
+      // (not if the page was edited, retaken or deleted meanwhile, nor for a crop that hardly differs)
+      const batch = S.batch;
+      if (r.quad && batch && batch.pageIds.includes(page.id) && page.quad === quad && maxDelta(r.quad, quad) > 0.01) {
+        const out = await engine.call("render", { frameBlob: page.frame, quad: r.quad, rotation: page.rotation, filter: page.filter, flatten: page.flat === true });
+        if (page.quad === quad && batch.pageIds.includes(page.id)) {
+          Object.assign(page, { quad: r.quad, pick: "sam", output: out.outputBlob, thumb: out.thumbBlob, w: out.w, h: out.h });
+          if (out.warpedBlob) { page.warped = out.warpedBlob; page.flatInfo = out.flat; }
+          await DB.put("pages", page);
+          setThumb(page);
+          if (S.screen === "review") renderReview();
+          toast(`Page ${batch.pageIds.indexOf(page.id) + 1}: crop redone by SlimSAM (${(r.ms / 1000).toFixed(1)} s).`, 2500);
+        }
+      }
+    } catch (err) {
+      console.warn("SlimSAM", err);
+    } finally {
+      sam.busy = false;
+      samNext();
+    }
+  }
+
   async function importFiles(files) {
     if (!S.batch) return;
     if (engine.state !== "ready") { toast("The scanner is still loading. Try again in a moment."); return; }
@@ -1250,6 +1296,7 @@
       batch.updatedAt = Date.now();
       await saveBatch();
       setThumb(page);
+      samLater(page, hint);
       if (retake) {
         toast(`Page ${batch.pageIds.indexOf(page.id) + 1} replaced.`);
         if (S.screen === "camera") show("review");
