@@ -171,7 +171,7 @@
     <button id="btnEdDelete" class="pill-btn pill-danger" type="button">Delete</button>
   </header>
   <div class="ed-stage">
-    <img id="edImg" alt="">
+    <img id="edImg" alt="" draggable="false">
     <div id="cropWrap" class="crop-wrap" hidden>
       <img id="cropImg" alt="Original photo">
       <svg id="cropSvg" preserveAspectRatio="xMidYMid meet">
@@ -185,11 +185,11 @@
     <div id="filterChips" class="chips" role="group" aria-label="Scan mode"></div>
     <button id="btnApplyAll" class="apply-all" type="button" hidden>Use this mode on all pages</button>
     <div class="tool-row tool-row-5">
-      <button id="btnMoveUp" class="tool" type="button">‹ Earlier</button>
+      <button id="btnMoveUp" class="tool" type="button" aria-label="Move this page one place earlier">‹ Move</button>
       <button id="btnCrop" class="tool" type="button">Crop</button>
       <button id="btnFlatten" class="tool tool-toggle" type="button" aria-pressed="false">Flatten</button>
       <button id="btnRotate" class="tool" type="button">Rotate</button>
-      <button id="btnMoveDown" class="tool" type="button">Later ›</button>
+      <button id="btnMoveDown" class="tool" type="button" aria-label="Move this page one place later">Move ›</button>
     </div>
   </div>
   <div id="cropBar" class="ed-tools" hidden>

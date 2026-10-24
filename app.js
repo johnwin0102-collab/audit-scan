@@ -4,7 +4,7 @@
 "use strict";
 
 (() => {
-  const VERSION = "1.3.4";
+  const VERSION = "1.3.5";
 
   const AREAS = [
     { value: "Mixed", label: "Mixed (Claude sorts)", short: "" },
@@ -1595,6 +1595,33 @@
     if (p) rerender(p, { rotation: ((p.rotation || 0) + 90) % 360 }, false);
   }
 
+  // Another page of the batch in the editor: dir -1 the one before, +1 the one after (a swipe on the page). Moving
+  // a page in the batch is movePage, below.
+  function showPage(dir) {
+    const p = curPage();
+    if (!p || !S.editor || S.editor.busy || S.editor.crop) return;
+    const ids = S.batch.pageIds, j = ids.indexOf(p.id) + dir;
+    if (j < 0 || j >= ids.length) return;
+    S.editor = { id: ids[j], crop: false, quad: null, busy: false, delArmed: false };
+    renderEditor();
+    // (a short slide in from the side it came from)
+    try { el.edImg.animate([{ transform: `translateX(${dir * 48}px)`, opacity: 0.3 }, { transform: "none", opacity: 1 }], { duration: 180, easing: "ease-out" }); }
+    catch (_) { /* no animation here */ }
+  }
+  // Swipes on the page in the editor: to the left for the next page, to the right for the one before.
+  function watchSwipes() {
+    const stage = el.edImg.parentElement;
+    let s = null;
+    stage.addEventListener("pointerdown", (e) => { s = S.editor && !S.editor.crop && e.isPrimary ? { x: e.clientX, y: e.clientY, t: performance.now() } : null; });
+    stage.addEventListener("pointerup", (e) => {
+      if (!s) return;
+      const dx = e.clientX - s.x, dy = e.clientY - s.y, dt = performance.now() - s.t;
+      s = null;
+      if (Math.abs(dx) > 50 && Math.abs(dx) > 1.5 * Math.abs(dy) && dt < 800) showPage(dx < 0 ? 1 : -1);
+    });
+    stage.addEventListener("pointercancel", () => { s = null; });
+  }
+
   async function movePage(dir) {
     const p = curPage();
     if (!p) return;
@@ -1982,6 +2009,7 @@
     el.btnFlatten.addEventListener("click", toggleFlatten);
     el.btnCrop.addEventListener("click", enterCrop);
     el.btnMoveUp.addEventListener("click", () => movePage(-1));
+    watchSwipes();
     el.btnMoveDown.addEventListener("click", () => movePage(1));
     el.btnCropAuto.addEventListener("click", cropDetect);
     el.btnCropFull.addEventListener("click", cropFull);
