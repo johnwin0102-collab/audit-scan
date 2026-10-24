@@ -1220,7 +1220,7 @@
         sam.worker.addEventListener("message", on);
         sam.worker.postMessage({ id, bitmap, hint, dir: ls.get("as.samDir", "slimsam"), threads: 3 }, [bitmap]);
       });
-      if (r.error) console.warn("SlimSAM", r.error);
+      if (r.error) { console.warn("SlimSAM", r.error); sam.err = r.error; }
       if (r.ms) { sam.ms = r.ms; sam.n++; }
       // (not if the page was edited, retaken or deleted meanwhile, nor for a crop that hardly differs)
       const batch = S.batch;
@@ -1237,6 +1237,7 @@
       }
     } catch (err) {
       console.warn("SlimSAM", err);
+      sam.err = String((err && err.message) || err);
     } finally {
       sam.busy = false;
       samNext();
@@ -2030,7 +2031,17 @@
 
   // Read by the automated tests; debugSlow makes the AI and the live outline take longer, like a slower phone.
   window.__auditScan = {
-    S, engine, finder, cam, live, stats, tracker, TUNE,
+    S, engine, finder, cam, live, stats, tracker, TUNE, sam,
+    // (tests: SlimSAM again on a captured page, with the AI's outline found afresh on its photo)
+    async samRedo(id) {
+      const p = S.pages.get(id);
+      if (!p || !p.frame) return "no page";
+      const bm = await createImageBitmap(p.frame);
+      const hint = await findPage(bm);
+      bm.close();
+      samLater(p, hint);
+      return hint ? "queued" : "no AI outline";
+    },
     debugSlow(mlMs, liveMs, trace, fuzz, read) {
       if (finder.worker) finder.worker.postMessage({ type: "debug", minMs: mlMs || 0, fuzz: fuzz || null });
       if (tracker.worker) tracker.worker.postMessage({ type: "debug", liveMs: liveMs || 0, trace: !!trace, read: read || "" });
