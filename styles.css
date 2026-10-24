@@ -277,7 +277,6 @@ label.btn:focus-within { outline: 3px solid var(--pen); outline-offset: 2px; }
 .tool { height: 46px; border-radius: 8px; border: 1px solid var(--cam-line); background: rgba(255, 255, 255, .04); color: var(--cam-ink); font-weight: 700; font-size: 14px; line-height: 1.1; cursor: pointer; padding: 0 4px; }
 .tool:disabled { opacity: .35; cursor: not-allowed; }
 .tool-primary { background: var(--quad-ok); color: var(--on-ok); border-color: transparent; }
-.tool-row-5 { grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; }
 .tool-toggle[aria-pressed="true"] { border-color: var(--quad-ok); color: var(--quad-ok); background: var(--quad-ok-fill); }
 .crop-hint { margin: 0; color: var(--cam-muted); font-size: 14px; text-align: center; }
 .busy { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(5, 8, 7, .45); }

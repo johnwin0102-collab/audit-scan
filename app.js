@@ -4,7 +4,7 @@
 "use strict";
 
 (() => {
-  const VERSION = "1.3.6";
+  const VERSION = "1.3.7";
 
   const AREAS = [
     { value: "Mixed", label: "Mixed (Claude sorts)", short: "" },
@@ -1589,9 +1589,10 @@
       else toast("Flattening off for this page.");
     });
   }
-  function rotatePage() {
+  // Turn the page a quarter: dir 1 to the right (clockwise), -1 to the left.
+  function rotatePage(dir) {
     const p = curPage();
-    if (p) rerender(p, { rotation: ((p.rotation || 0) + 90) % 360 }, false);
+    if (p) rerender(p, { rotation: ((p.rotation || 0) + (dir < 0 ? 270 : 90)) % 360 }, false);
   }
 
   // Swipes on the page in the editor, as in a phone's photo gallery: the page follows the finger; let go past a third
@@ -1659,20 +1660,6 @@
     };
     stage.addEventListener("pointerup", up);
     stage.addEventListener("pointercancel", up);
-  }
-
-  // Move the page shown one place earlier or later in the batch (it stays on screen; say where it went).
-  async function movePage(dir) {
-    const p = curPage();
-    if (!p) return;
-    const ids = S.batch.pageIds;
-    const i = ids.indexOf(p.id), j = i + dir;
-    if (i < 0) return;
-    if (j < 0 || j >= ids.length) { toast(dir < 0 ? "This is already the first page." : "This is already the last page.", 2000); return; }
-    [ids[i], ids[j]] = [ids[j], ids[i]];
-    await saveBatch().catch(() => {});
-    renderEditor();
-    toast(`Moved to page ${j + 1} of ${ids.length}.`, 2000);
   }
 
   let delTimer = 0;
@@ -1998,7 +1985,7 @@
       "camError", "camErrorText", "btnRetryCam", "btnCamBack", "camLabel", "btnTorch", "btnAuto", "btnThumb", "thumbImg",
       "pageCount", "btnShutter", "ringArc", "btnDone", "btnReviewBack", "reviewMeta", "reviewEmpty", "grid", "btnAddPages",
       "importInput", "btnSave", "btnEdBack", "edTitle", "edMeta", "btnEdDelete", "edImg", "cropWrap", "cropImg", "cropSvg",
-      "cropPoly", "cropHandles", "edBusy", "edTools", "filterChips", "btnMoveUp", "btnCrop", "btnRotate", "btnMoveDown",
+      "cropPoly", "cropHandles", "edBusy", "edTools", "filterChips", "btnRotLeft", "btnCrop", "btnRotate",
       "cropBar", "btnCropAuto", "btnCropFull", "btnCropCancel", "btnCropApply", "saveSheet", "saveName", "saveInfo",
       "saveActions", "saveHelp", "btnShare", "btnDownload", "btnSaveCancel", "saveDone", "saveDoneText", "btnNewBatch",
       "btnKeepBatch", "toast", "modeStrip", "undoBar", "undoText", "btnUndo", "btnApplyAll", "btnRetake", "btnDeleteAllSaved", "btnFlatten",
@@ -2047,12 +2034,11 @@
     el.btnRetake.addEventListener("click", retakePage);
     el.btnApplyAll.addEventListener("click", applyAll);
     el.btnDeleteAllSaved.addEventListener("click", onDeleteAllSaved);
-    el.btnRotate.addEventListener("click", rotatePage);
+    el.btnRotLeft.addEventListener("click", () => rotatePage(-1));
+    el.btnRotate.addEventListener("click", () => rotatePage(1));
     el.btnFlatten.addEventListener("click", toggleFlatten);
     el.btnCrop.addEventListener("click", enterCrop);
-    el.btnMoveUp.addEventListener("click", () => movePage(-1));
     watchSwipes();
-    el.btnMoveDown.addEventListener("click", () => movePage(1));
     el.btnCropAuto.addEventListener("click", cropDetect);
     el.btnCropFull.addEventListener("click", cropFull);
     el.btnCropCancel.addEventListener("click", exitCrop);

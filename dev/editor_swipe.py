@@ -1,12 +1,12 @@
 """Editor test: make a batch of three pages on a fake camera video, open the first page, swipe left and right on it
-(touch), and check the page shown changes (title and picture); then check Move moves the page in the batch.
-usage: editor_swipe.py <app folder> <port> [video]"""
+(touch), and check the page shown changes (title and picture) without a blink; then rotate it left and right.
+usage: editor_swipe.py <app folder> <port> [video] [--shot out.png]"""
 import asyncio, os, subprocess, sys, time
 from playwright.async_api import async_playwright
 
 LIVE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "videos")
 repo, port = sys.argv[1], int(sys.argv[2])
-video = sys.argv[3] if len(sys.argv) > 3 else "wood"
+video = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else "wood"
 
 
 async def swipe(pg, dx, steps=8, gap=16):
@@ -79,17 +79,17 @@ async def main():
             print("start ", s0["title"]); print("left  ", s1["title"]); print("left  ", s2["title"]); print("right ", s3["title"])
             ok &= s1["id"] == s0["ids"][1] and s2["id"] == s0["ids"][2] and s3["id"] == s0["ids"][1]
             ok &= s1["src"] != s0["src"] and s2["src"] != s1["src"]
-            # Move: the page shown (now the 2nd) goes one place earlier; it stays on screen as page 1, and says so
-            await pg.click("#btnMoveUp")
-            await pg.wait_for_timeout(300)
-            s4 = await state(pg)
-            t1 = await pg.evaluate("document.getElementById('toast').textContent")
-            print("move  ", s4["title"], "order changed:", s4["ids"] != s3["ids"], "| message:", t1)
-            ok &= s4["id"] == s3["id"] and s4["ids"][0] == s3["id"] and s4["title"].startswith("Page 1")
-            await pg.click("#btnMoveUp")
-            await pg.wait_for_timeout(300)
-            t2 = await pg.evaluate("document.getElementById('toast').textContent")
-            print("move again on page 1 | message:", t2)
+            # Rotate: left turns the page a quarter anticlockwise (270), right turns it back (0); the picture changes each time
+            rot = lambda: pg.evaluate("window.__auditScan.S.pages.get(window.__auditScan.S.editor.id).rotation || 0")
+            busy = "!window.__auditScan.S.editor.busy"
+            await pg.click("#btnRotLeft"); await pg.wait_for_timeout(200); await pg.wait_for_function(busy, timeout=60000)
+            r1, s4 = await rot(), await state(pg)
+            await pg.click("#btnRotate"); await pg.wait_for_timeout(200); await pg.wait_for_function(busy, timeout=60000)
+            r2, s5 = await rot(), await state(pg)
+            print("rotate left ->", r1, "| right ->", r2, "| picture changed:", s4["src"] != s3["src"], s5["src"] != s4["src"])
+            ok &= r1 == 270 and r2 == 0 and s4["src"] != s3["src"] and s5["src"] != s4["src"]
+            ok &= await pg.evaluate("!document.getElementById('btnMoveUp') && !document.getElementById('btnMoveDown')")
+            if "--shot" in sys.argv: await pg.screenshot(path=sys.argv[sys.argv.index("--shot") + 1])
             await b.close()
     finally:
         srv.terminate()
